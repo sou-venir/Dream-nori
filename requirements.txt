@@ -1,6 +1,6 @@
 flask
 flask-socketio
 pyngrok
-openai
+openai==0.28.1
 python-dotenv
 eventlet
