@@ -15,11 +15,13 @@
 2. `requirements.txt`에 적힌 라이브러리를 설치합니다:
    ```bash
    pip install -r requirements.txt
+   ```
 3. 프로젝트 루트 폴더에 `.env` 파일을 생성하고 아래 내용을 입력합니다
-```env
-OPENAI_API_KEY=발급받은_openai_API_키
-NGROK_AUTH_TOKEN=발급받은_Ngrok_토큰
-ADMIN_PASSWORD=3896
+   ```env
+   OPENAI_API_KEY=발급받은_openai_API_키
+   NGROK_AUTH_TOKEN=발급받은_Ngrok_토큰
+   ADMIN_PASSWORD=3896
+   ```
 4. 서버를 실행합니다
    ```bash
    python app.py
