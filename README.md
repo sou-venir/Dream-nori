@@ -22,4 +22,4 @@ NGROK_AUTH_TOKEN=발급받은_Ngrok_토큰
 ADMIN_PASSWORD=3896
 4. 서버를 실행합니다
    ```bash
-python app.py
+   python app.py
