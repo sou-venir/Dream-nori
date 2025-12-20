@@ -12,17 +12,32 @@
 
 ## 🚀 시작하기
 1. 화면 우측 상단의 초록색 [Code] 버튼을 누르고 [Download ZIP]을 클릭하세요.
+   
 2. 다운로드 받은 압축 파일을 원하는 폴더에 풀어줍니다.
-3. `requirements.txt`에 적힌 라이브러리를 설치합니다:
+   
+3. 압축을 푼 폴더 창의 주소창에 `cmd`라고 치거나, 터미널을 열고 아래 명령어를 입력하세요:
    ```bash
    pip install -r requirements.txt
    ```
-4. 프로젝트 루트 폴더에 `.env` 파일을 생성하고 아래 내용을 입력합니다
-   ```env
-   OPENAI_API_KEY=발급받은_openai_API_키
-   NGROK_AUTH_TOKEN=발급받은_Ngrok_토큰
+   
+4. 키 등록하기 (중요!)
+- 폴더 안에 새 텍스트 문서를 하나 만듭니다.
+- 이름을 `.env`로 바꿔주세요. (뒤에 `.txt`가 붙지 않게 주의!)
+- 그 파일을 메모장으로 열고 아래 내용을 채워 넣으세요
+   ```코드 스니펫
+   OPENAI_API_KEY=내_openai_API_키
+   NGROK_AUTH_TOKEN=내_Ngrok_토큰
    ADMIN_PASSWORD=3896
    ```
-5. 서버를 실행합니다
+   
+5. 프로그램을 실행합니다.
+- 다시 터미널 창에 아래 명령어를 입력합니다:
    ```bash
    python app.py
+   ```
+   
+- 잠시 기다리면 화면에 나오는 https://xxxx.ngrok-free.app 형태의 주소를 클릭해서 접속하시면 됩니다.
+
+
+
+  
