@@ -43,7 +43,7 @@ def load_data():
 # --- 서버 초기 상태 ---
 initial_state = {
     "session_title": "드림놀이",
-    "theme": {"bg": "#0d0d0f", "panel": "#1a1a1f", "accent": "#e91e63"},
+    "theme": {"bg": "#ffffff", "panel": "#1a1a1f", "accent": "#e91e63"},
     "accent_color": "#e91e63",
     "admin_password": ADMIN_PASSWORD,
     "is_locked": False,
@@ -69,7 +69,7 @@ def analyze_theme_color(title, sys_prompt):
             model="gpt-5.2",
             messages=[{
                 "role": "system",
-                "content": "너는 웹 디자인 전문가야. 세션 설정에 어울리는 테마 색상 3개를 골라줘. 모든 UI 글씨는 검은색이야. JSON 형식: {\"bg\": \"색상\", \"panel\": \"색상\", \"accent\": \"색상\"}"
+                "content": "모든 글씨는 검은색이므로, 배경(bg)과 패널(panel)은 반드시 글씨가 잘 보이는 밝은 파스텔톤이나 밝은 회색 계열로 골라야 해. JSON 형식: {\"bg\": \"색상\", \"panel\": \"색상\", \"accent\": \"색상\"}"
             }, {
                 "role": "user",
                 "content": f"제목: {title}\n설정: {sys_prompt}"
