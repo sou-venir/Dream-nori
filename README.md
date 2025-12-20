@@ -11,17 +11,18 @@
 - **프롤로그 & 요약**: 시작 설정과 줄거리를 자유롭게 관리하세요.
 
 ## 🚀 시작하기
-1. 이 저장소를 클론(Clone)합니다.
-2. `requirements.txt`에 적힌 라이브러리를 설치합니다:
+1. 화면 우측 상단의 초록색 [Code] 버튼을 누르고 [Download ZIP]을 클릭하세요.
+2. 다운로드 받은 압축 파일을 원하는 폴더에 풀어줍니다.
+3. `requirements.txt`에 적힌 라이브러리를 설치합니다:
    ```bash
    pip install -r requirements.txt
    ```
-3. 프로젝트 루트 폴더에 `.env` 파일을 생성하고 아래 내용을 입력합니다
+4. 프로젝트 루트 폴더에 `.env` 파일을 생성하고 아래 내용을 입력합니다
    ```env
    OPENAI_API_KEY=발급받은_openai_API_키
    NGROK_AUTH_TOKEN=발급받은_Ngrok_토큰
    ADMIN_PASSWORD=3896
    ```
-4. 서버를 실행합니다
+5. 서버를 실행합니다
    ```bash
    python app.py
