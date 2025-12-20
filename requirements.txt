@@ -1,0 +1,6 @@
+flask
+flask-socketio
+pyngrok
+openai
+python-dotenv
+eventlet
