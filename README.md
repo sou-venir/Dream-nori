@@ -1,4 +1,5 @@
 # 드림놀이
+### ※데스크탑 UI만 지원합니다, 꼭 한 링크로 두명이 들어가야 합니다!
 
 - 친구 드림복지해주려고 만든 2인용 드림페어세션 ai 시뮬레이터인데 공유해도 좋을것같다싶어서 올려봅니다.
 - 제미나이한테 많이 의존해서 이상한 부분이 많을 수도 있습니다. 기본으로 ai는 GPT 5.2로 설정되어 있습니다.
@@ -52,6 +53,11 @@
 - 잠시 기다리면 화면에 나오는 https://xxxx.ngrok-free.app 형태의 주소를 클릭해서 접속하시면 됩니다.
 
 ## 🔰 컴퓨터에 설치하는 법을 모르겠어요
-
+1. 이 링크를 클릭해서 코랩을 열어주세요 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/sou-venir/Dream-nori/blob/main/%EC%BD%94%EB%9E%A9%EC%9D%84%EC%9C%84%ED%95%9C%EB%93%9C%EB%A6%BC%EB%86%80%EC%9D%B4.ipynb)
+2. 화면 왼쪽의 열쇠(🔑) 아이콘을 눌러주세요
+3. OPENAI_API_KEY와 NGROK_AUTH_TOKEN을 각각 입력하고(꼭 이 이름으로 저장하셔야 합니다!), 오른쪽의 스위치(노트북 액세스)를 반드시 ON으로 켭니다.
+4. 상단 메뉴에서 [런타임] -> [모두 실행]을 누릅니다. (또는 키보드의 Ctrl + F9)
+5. 중간에 뜨는 구글 드라이브 연결 팝업에서 [허용]을 눌러주세요.
+6. 화면 맨 아래로 내려가서 🚀 접속 주소: https://...ngrok-free.app 링크가 나오면 클릭해서 접속합니다!
 
   
