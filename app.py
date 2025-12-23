@@ -82,115 +82,19 @@ def analyze_theme_color(title, sys_prompt):
         return {"bg": "#0d0d0f", "panel": "#1a1a1f", "accent": "#e91e63"}
 
 # --- HTML 템플릿 (보내주신 코드 유지) ---
-HTML_TEMPLATE = """# 1. 라이브러리 설치 및 기존 프로세스 정리
-!pip install flask-socketio flask-ngrok pyngrok openai python-socketio eventlet
-!fuser -k 5000/tcp
-
-import os
-import json
-from flask import Flask, render_template_string
-from flask_socketio import SocketIO, emit
-from pyngrok import ngrok
-from google.colab import userdata
-import openai
-from google.colab import drive
-import os
-
-# Google Drive 마운트
-drive.mount('/content/drive')
-
-# 저장될 폴더 경로 설정 (내 드라이브의 'ChatData' 폴더 예시)
-# 폴더가 없으면 자동으로 생성합니다.
-SAVE_PATH = '/content/drive/MyDrive/ChatData'
-if not os.path.exists(SAVE_PATH):
-    os.makedirs(SAVE_PATH)
-# --- 2. 보안 설정 및 AI 초기화 ---
-try:
-    NGROK_TOKEN = userdata.get('NGROK_AUTH_TOKEN')
-    OPENAI_API_KEY = userdata.get('OPENAI_API_KEY')
-    client = openai.OpenAI(api_key=OPENAI_API_KEY)
-    ngrok.set_auth_token(NGROK_TOKEN)
-except Exception as e:
-    print(f"❌ 시크릿 설정 확인 필요: {e}")
-
-app = Flask(__name__)
-socketio = SocketIO(app, cors_allowed_origins="*")
-
-DATA_FILE = os.path.join(SAVE_PATH, "save_data.json")
-
-# [저장 로직] 상태가 변할 때마다 파일에 기록
-def save_data():
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, indent=4)
-
-# [불러오기 로직] 서버가 켜질 때 기존 데이터를 가져옴
-def load_data():
-    if os.path.exists(DATA_FILE):
-        try:
-            with open(DATA_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except:
-            return None
-    return None
-
-# --- 3. 서버 상태 관리 (파일에서 읽어오거나 기본값 설정) ---
-initial_state = {
-    "session_title": "드림놀이",
-    "theme": {"bg": "#0d0d0f", "panel": "#1a1a1f", "accent": "#e91e63"},
-    "accent_color": "#e91e63",
-    "admin_password": "3896",
-    "inputs": {"user1": None, "user2": None},
-    "profiles": {
-        "user1": {"name": "Player 1", "bio": "", "canon": ""},
-        "user2": {"name": "Player 2", "bio": "", "canon": ""}
-    },
-    "history": [],
-    "ai_history": [],
-    "summary": "기록된 줄거리가 없습니다.",
-    "prologue": "프롤로그를 작성해주세요.",
-    "sys_prompt": "마스터 프롬프트",
-    "lorebook": []
-}
-
-saved_state = load_data()
-state = saved_state if saved_state else initial_state
-
-# --- 4. 백엔드 AI 로직 (analyze_theme_color 수정) ---
-def analyze_theme_color(title, sys_prompt):
-    try:
-        response = client.chat.completions.create(
-
-            model="gpt-4o",
-            messages=[{
-                "role": "system",
-                "content": "너는 웹 디자인 전문가야. 세션 설정에 어울리는 테마 색상 3개를 골라줘. 참고로 모든 UI의 글씨는 검은색이 될 거야. JSON 형식으로만 답변해: {\"bg\": \"배경색\", \"panel\": \"패널색\", \"accent\": \"강조색\"}"
-            }, {
-                "role": "user",
-                "content": f"제목: {title}\n설정: {sys_prompt}"
-            }],
-            response_format={ "type": "json_object" }
-        )
-        palette = json.loads(response.choices[0].message.content)
-        # 색상 값이 누락되었을 경우를 대비해 기본값 병합
-        default = {"bg": "#ffffff", "panel": "#1a1a1f", "accent": "#e91e63"}
-        default.update(palette)
-        return default
-    except:
-        return {"bg": "#ffffff", "panel": "#1a1a1f", "accent": "#e91e63"}
-# --- 5. HTML 템플릿 (수정됨) ---
 HTML_TEMPLATE = """<!DOCTYPE html>
 
 <html>
 
 <head>
 
-    <meta charset="UTF-8">
+    <meta charset=\"UTF-8\">
 
     <title>드림놀이</title>
 
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
+    <script src=\"https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js\"></script>
 
-    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <script src=\"https://cdn.jsdelivr.net/npm/marked/marked.min.js\"></script>
 
     <style>
 
@@ -207,6 +111,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         }
 
 
+        /* 1. 모달이 화면을 벗어나지 않게 고정 */
 
         html, body { height: 100%; margin: 0; overflow: hidden; }
 
@@ -258,17 +163,95 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
 
 
-        #admin-modal { display: none; position: fixed; z-index: 9999; left: 0; top: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); align-items: center; justify-content: center; }
+        /* 1. 모달 배경 및 컨테이너 */
+#admin-modal {
+    display: none;
+    position: fixed;
+    z-index: 10000;
+    left: 0; top: 0;
+    width: 100vw; height: 100vh;
+    background: rgba(0, 0, 0, 0.6);
+    backdrop-filter: blur(5px);
+    align-items: center; justify-content: center;
+}
 
-        .modal-content { width: 90%; max-width: 700px; max-height: 85vh; overflow-y: auto; background: var(--bg) !important; border: 2px solid var(--accent); padding: 25px; border-radius: 12px; }
+.modal-content {
+    width: 95%; max-width: 1200px; height: 85vh;
+    background: #ffffff; border-radius: 16px;
+    display: flex; flex-direction: column;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+    overflow: hidden;
+}
 
-        .tab-btn { background: #e0e0e0; color: #666; margin-right: 5px; }
+/* 2. 상단 헤더 & 탭 메뉴 */
+.modal-header {
+    height: 60px; display: flex; justify-content: space-between; align-items: center;
+    padding: 0 25px; background: #f8f9fa; border-bottom: 1px solid #eee;
+}
 
-        .tab-btn.active { background: var(--accent); color: #000 !important; }
+.tab-group { display: flex; height: 100%; gap: 10px; }
+.tab-btn {
+    border: none; background: none; padding: 0 15px;
+    font-size: 14px; font-weight: 600; color: #777;
+    cursor: pointer; position: relative; transition: 0.2s;
+}
+.tab-btn.active { color: var(--accent); }
+.tab-btn.active::after {
+    content: ""; position: absolute; bottom: 0; left: 0;
+    width: 100%; height: 3px; background: var(--accent);
+}
 
-        .tab-content { display: none; margin-top: 15px; flex-direction: column; gap: 10px; }
+.close-btn {
+    width: 32px; height: 32px; border-radius: 50%; border: none;
+    background: #eee; cursor: pointer; font-size: 16px;
+}
 
-        .tab-content.active { display: flex; }
+/* 3. 모달 바디 (좌우 분할) */
+.modal-body { flex: 1; display: flex; overflow: hidden; }
+
+.tab-content {
+    display: none; width: 100%; height: 100%;
+    flex-direction: row; /* 좌우 배치 */
+}
+.tab-content.active { display: flex; }
+
+/* 왼쪽 편집창 */
+.editor-side {
+    flex: 1.3; padding: 25px; display: flex; flex-direction: column;
+    gap: 15px; overflow-y: auto; border-right: 1px solid #f0f0f0;
+}
+
+/* 오른쪽 정보창 */
+.list-side {
+    flex: 0.7; padding: 25px; background: #fafafa;
+    display: flex; flex-direction: column; gap: 15px; overflow-y: auto;
+}
+
+/* 4. 내부 요소 디자인 */
+.editor-side label, .list-side label {
+    font-size: 12px; font-weight: 800; color: #999; text-transform: uppercase;
+}
+
+.editor-side input, .editor-side select, .editor-side textarea, .list-side textarea {
+    width: 100%; border: 1px solid #ddd; border-radius: 8px;
+    padding: 12px; font-size: 14px; font-family: inherit;
+    background: #fff !important;
+}
+
+.editor-side textarea { flex: 1; min-height: 200px; resize: none; }
+.list-side textarea { height: 100%; resize: none; }
+
+.save-btn {
+    background: var(--accent); color: white !important;
+    padding: 15px; border-radius: 10px; font-weight: bold;
+    cursor: pointer; border: none; margin-top: 5px;
+}
+
+/* 키워드 아이템 */
+.lore-item {
+    background: #fff; border: 1px solid #eee; padding: 12px;
+    border-radius: 10px; position: relative; margin-bottom: 8px;
+}
 
     </style>
 
@@ -276,19 +259,19 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
 <body>
 
-    <div id="main">
+    <div id=\"main\">
 
-        <div id="chat-window"><div id="chat-content"></div></div>
+        <div id=\"chat-window\"><div id=\"chat-content\"></div></div>
 
-        <div id="input-area" style="padding:20px; background: var(--bg);">
+        <div id=\"input-area\" style=\"padding:20px; background: var(--bg);\">
 
-            <div id="status" style="font-size: 12px; margin-bottom: 5px; color: var(--accent); font-weight: bold;">대기 중</div>
+            <div id=\"status\" style=\"font-size: 12px; margin-bottom: 5px; color: var(--accent); font-weight: bold;\">대기 중</div>
 
-            <div style="display:flex; gap:10px;">
+            <div style=\"display:flex; gap:10px;\">
 
-                <textarea id="msg-input" placeholder="설정 완료 후 잠금 버튼을 눌러주세요."></textarea>
+                <textarea id=\"msg-input\" placeholder=\"설정 완료 후 잠금 버튼을 눌러주세요.\"></textarea>
 
-                <button onclick="send()" style="width:80px;">전송</button>
+                <button onclick=\"send()\" style=\"width:80px;\">전송</button>
 
             </div>
 
@@ -298,114 +281,128 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
 
 
-    <div id="sidebar">
+   <div id="sidebar">
+
+
 
         <h3>🎭 설정</h3>
 
+
+
         <select id="user-role" onchange="refreshUI()">
+
+
 
             <option value="user1">Player 1</option>
 
+
+
             <option value="user2">Player 2</option>
+
+
 
         </select>
 
+
+
         <input type="text" id="p-name" placeholder="이름">
+    <textarea id="p-bio" style="height:120px;" placeholder="캐릭터 설정"></textarea>
+    <textarea id="p-canon" style="height:80px;" placeholder="관계 설정"></textarea>
 
-        <textarea id="p-bio" style="height:120px;" placeholder="캐릭터 설정"></textarea>
+    <button onclick="saveProfile()" id="ready-btn" style="background:var(--accent); color:white !important;">
+        ✅ 설정 저장 및 준비 완료
+    </button>
 
-        <textarea id="p-canon" style="height:80px;" placeholder="드림캐 설정"></textarea>
-
-        <button onclick="saveProfile()">설정 저장</button>
-
-        <button id="lock-btn" onclick="confirmLock()" style="background:var(--accent); color:white !important;">🔒 설정 완료 및 잠금</button>
-
-        <button onclick="requestAdmin()" style="background:#ddd; margin-top:auto;">⚙️ 마스터 설정</button>
-
+    <div id="ready-status" style="font-size:11px; margin-top:5px; color:#666;">
+        대기 중...
     </div>
+
+    <div style="flex: 1;"></div>
+    <button onclick="requestAdmin()" style="background:transparent; color:#999 !important; border: 1px solid #ddd;">⚙️ 마스터 설정 </button>
+</div>
 
 
 
     <div id="admin-modal">
-
         <div class="modal-content">
-
-            <div style="display:flex; gap:5px; margin-bottom:15px;">
-
-                <button class="tab-btn active" onclick="openTab(event, 't-base')">시스템</button>
-
-                <button class="tab-btn" onclick="openTab(event, 't-ex')">예시 학습</button>
-
-                <button class="tab-btn" onclick="openTab(event, 't-lore')">키워드북</button>
-
-                <button onclick="closeModal()" style="margin-left:auto; background:#ddd;">닫기</button>
-
+            <div class="modal-header">
+                <div class="tab-group">
+                    <button class="tab-btn active" onclick="openTab(event, 't-base')">⚙️ 엔진</button>
+                    <button class="tab-btn" onclick="openTab(event, 't-story')">🎬 서사</button>
+                    <button class="tab-btn" onclick="openTab(event, 't-ex')">💡 학습</button>
+                    <button class="tab-btn" onclick="openTab(event, 't-lore')">📚 키워드</button>
+                </div>
+                <button onclick="closeModal()" class="close-btn">✕</button>
             </div>
 
-
-
-            <div id="t-base" class="tab-content active">
-
-                <input type="text" id="m-title" placeholder="세션 제목">
-
-                <textarea id="m-sys" style="height:180px;" placeholder="시스템 프롬프트"></textarea>
-
-                <textarea id="m-pro" style="height:120px;" placeholder="프롤로그"></textarea>
-
-                <textarea id="m-sum" style="height:80px;" placeholder="줄거리 요약"></textarea>
-
-                <button onclick="saveMaster()">설정 및 테마 업데이트</button>
-
-            </div>
-
-
-
-            <div id="t-ex" class="tab-content">
-
-                <h4>💡 AI 예시 대화 학습</h4>
-
-                <div id="ex-inputs">
-
-                    <div style="margin-bottom:10px;"><textarea id="ex-q-0" placeholder="예시 질문 1"></textarea><textarea id="ex-a-0" placeholder="AI 답변 예시 1" style="border-left:4px solid var(--accent);"></textarea></div>
-
-                    <div style="margin-bottom:10px;"><textarea id="ex-q-1" placeholder="예시 질문 2"></textarea><textarea id="ex-a-1" placeholder="AI 답변 예시 2" style="border-left:4px solid var(--accent);"></textarea></div>
-
-                    <div style="margin-bottom:10px;"><textarea id="ex-q-2" placeholder="예시 질문 3"></textarea><textarea id="ex-a-2" placeholder="AI 답변 예시 3" style="border-left:4px solid var(--accent);"></textarea></div>
-
+            <div class="modal-body">
+                <div id="t-base" class="tab-content active">
+                    <div class="editor-side">
+                        <label>AI 모델 선택</label>
+                        <select id="m-ai-model">
+                            <option value="gpt-5.2">OpenAI GPT-5.2</option>
+                            <option value="gpt-4o">OpenAI GPT-4o</option>
+                            <option value="gemini-3-pro-preview">Google Gemini 3 Pro</option>
+                        </select>
+                        <label>시스템 프롬프트 (AI 지침)</label>
+                        <textarea id="m-sys" placeholder="AI에게 줄 지침..."></textarea>
+                        <button onclick="saveMaster()" class="save-btn">💾 엔진 설정 저장</button>
+                    </div>
+                    <div class="list-side">
+                        <label>안내</label>
+                        <p style="font-size:13px; color:#666;">엔진 모델과 전체적인 AI의 페르소나를 결정합니다.</p>
+                        <button class="btn-reset" onclick="sessionReset()" style="margin-top: auto;">⚠️ 세션 완전 초기화</button>
+                    </div>
                 </div>
 
-                <button onclick="saveExamples()">예시 대화 저장</button>
+                <div id="t-story" class="tab-content">
+                    <div class="editor-side">
+                        <label>🏷️ 세션 제목</label>
+                        <input type="text" id="m-title" placeholder="제목">
 
-                <button class="btn-reset" onclick="sessionReset()">⚠️ 세션 종료 및 전체 초기화</button>
+                        <label>📌 현재 상황 요약</label>
+                        <textarea id="m-sum" style="height:100px; flex:none;" placeholder="지금까지의 핵심 내용..."></textarea>
 
-            </div>
+                        <label>📖 프롤로그</label>
+                        <textarea id="m-pro" placeholder="이야기의 시작..."></textarea>
 
-
-
-            <div id="t-lore" class="tab-content">
-
-                <div style="display:grid; grid-template-columns: 1fr 1fr 60px; gap:5px;">
-
-                    <input type="text" id="kw-t" placeholder="키워드">
-
-                    <input type="text" id="kw-tr" placeholder="트리거">
-
-                    <input type="number" id="kw-p" value="0">
-
+                        <button onclick="saveMaster()" class="save-btn">💾 모든 서사 저장</button>
+                    </div>
+                    <div class="list-side">
+                        <label>💡 서사 팁</label>
+                        <p style="font-size:13px; color:#666;">서사는 AI가 이야기의 맥락을 파악하는 데 가장 중요한 정보야.</p>
+                    </div>
                 </div>
 
-                <textarea id="kw-c" style="height:100px;" placeholder="상세 내용"></textarea>
+                <div id="t-ex" class="tab-content">
+                    <div class="editor-side">
+                        <label>💡 학습 데이터 (대화 예시)</label>
+                        <textarea id="ex-data" placeholder="[User]: 안녕!&#10;[AI]: 반가워요!"></textarea>
+                        <button onclick="saveExamples()" class="save-btn">💡 학습 데이터 저장</button>
+                    </div>
+                    <div class="list-side"><label>도움말</label><p style="font-size:12px;">원하는 말투를 직접 적어줘.</p></div>
+                </div>
 
-                <button onclick="addLore()">키워드 추가 / 수정</button>
-
-                <div id="lore-list" style="margin-top:10px;"></div>
-
+                <div id="t-lore" class="tab-content">
+                    <div class="editor-side">
+                        <label>🔍 키워드 이름</label>
+                        <input type="text" id="kw-t" placeholder="이름">
+                        <label>🎯 트리거 (단어 입력 후 엔터/스페이스)</label>
+                        <div id="tag-container">
+                            <input type="text" id="tag-input" placeholder="태그 추가..." style="border:none !important; width: 100px !important; outline:none; background:transparent !important;">
+                        </div>
+                        <label>📝 상세 설정</label>
+                        <textarea id="kw-c" placeholder="AI에게 전달할 설정 내용..."></textarea>
+                        <button id="lore-save-btn" onclick="addLoreWithTags()" class="save-btn">➕ 키워드 저장</button>
+                    </div>
+                    <div class="list-side">
+                        <label>📋 우선순위 (드래그하여 이동)</label>
+                        <div id="lore-list" style="flex: 1; overflow-y: auto; display:flex; flex-direction:column; gap:8px;"></div>
+                    </div>
+                </div>
             </div>
-
         </div>
-
     </div>
-
 <script>
 
     const socket = io();
@@ -454,7 +451,28 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
     });
 
+    // 타이핑 효과 함수
+function typeWriter(element, text, i = 0) {
+    if (i === 0) {
+        element.innerHTML = ""; // 처음 시작할 때 비우기
+        element.style.whiteSpace = "pre-wrap"; // 줄바꿈 유지
+    }
 
+    if (i < text.length) {
+        // 텍스트를 한 글자씩 추가 (마크다운 적용 전 raw 텍스트로)
+        element.textContent += text.charAt(i);
+        i++;
+
+        // 스크롤 아래로 고정
+        const win = document.getElementById('chat-window');
+        win.scrollTop = win.scrollHeight;
+
+        setTimeout(() => typeWriter(element, text, i), 35); // 35ms 속도로 출력
+    } else {
+        // 타이핑이 모두 끝나면 최종적으로 마크다운 렌더링 적용
+        element.innerHTML = marked.parse(text);
+    }
+}
 
     function refreshUI() {
 
@@ -466,7 +484,28 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
         applyLockUI();
 
+    function applyLockUI() {
+    if(!gState) return;
 
+    const role = document.getElementById('user-role').value;
+    const p = gState.profiles[role];
+
+    // 이미 이름이 저장되어 있는 상태라면 (즉, 한번 확정했다면)
+    if(p.name && p.name !== "Player 1" && p.name !== "Player 2") {
+        document.getElementById('p-name').readOnly = true;
+        document.getElementById('p-bio').readOnly = true;
+        document.getElementById('p-canon').readOnly = true;
+        document.getElementById('ready-btn').disabled = true;
+        document.getElementById('ready-btn').innerText = "🔒 설정 고정됨";
+    } else {
+        // 아직 설정 전이라면 풀어주기
+        document.getElementById('p-name').readOnly = false;
+        document.getElementById('p-bio').readOnly = false;
+        document.getElementById('p-canon').readOnly = false;
+        document.getElementById('ready-btn').disabled = false;
+        document.getElementById('ready-btn').innerText = "✅ 설정 저장 및 준비 완료";
+    }
+}
 
         const role = document.getElementById('user-role').value;
 
@@ -515,46 +554,50 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
 
         function renderChat() {
+    let h = `<div style="text-align:center; padding:20px; color:var(--accent); font-weight:bold; font-size:1.4em;">${gState.session_title}</div>`;
+    h += `<div class="bubble center-ai"><b>[PROLOGUE]</b><br>${marked.parse(gState.prologue || "")}</div>`;
 
-            let h = `<div style="text-align:center; padding:20px; color:var(--accent); font-weight:bold; font-size:1.4em;">${gState.session_title}</div>`;
+    const contentDiv = document.getElementById('chat-content');
+    const history = gState.ai_history;
+    const role = document.getElementById('user-role').value;
+    const pName = gState.profiles[role].name;
 
-            h += `<div class="bubble center-ai"><b>[PROLOGUE]</b><br>${marked.parse(gState.prologue || "")}</div>`;
+    // 전체 히스토리 렌더링
+    history.forEach((msg, index) => {
+        const isUser = pName && msg.includes(`**${pName}**:`);
+        const isLastMsg = (index === history.length - 1);
+        const isAI = msg.startsWith("**AI**:");
 
-            gState.ai_history.forEach(msg => {
+        // 마지막 메시지가 AI인 경우에만 타이핑 효과 적용
+        if (isLastMsg && isAI) {
+            const bubbleId = `typing-${index}`;
+            h += `<div id="${bubbleId}" class="bubble center-ai"></div>`;
+            contentDiv.innerHTML = h; // 먼저 틀을 만들고
 
-                const role = document.getElementById('user-role').value;
-
-                const pName = gState.profiles[role].name;
-
-                const isUser = pName && msg.includes(`**${pName}**:`);
-
-                h += `<div class="bubble ${isUser ? 'user-bubble' : 'center-ai'}">${marked.parse(msg)}</div>`;
-
-            });
-
-            document.getElementById('chat-content').innerHTML = h;
-
-            const win = document.getElementById('chat-window');
-
-            win.scrollTop = win.scrollHeight;
-
+            const targetElement = document.getElementById(bubbleId);
+            typeWriter(targetElement, msg); // 타이핑 시작!
+        } else {
+            h += `<div class="bubble ${isUser ? 'user-bubble' : 'center-ai'}">${marked.parse(msg)}</div>`;
         }
+    });
 
+    if (history.length === 0 || !history[history.length-1].startsWith("**AI**:")) {
+        contentDiv.innerHTML = h;
+    }
+
+    const win = document.getElementById('chat-window');
+    win.scrollTop = win.scrollHeight;
+}
 
 
         function send() {
-
-            const input = document.getElementById('msg-input');
-
-            const text = input.value.trim();
-
-            if(!text || !gState.is_locked) return;
-
-            socket.emit('client_message', { uid: document.getElementById('user-role').value, text });
-
-            input.value = '';
-
-        }
+    const input = document.getElementById('msg-input');
+    const text = input.value.trim();
+    // gState.is_locked 체크를 없애거나, 저장 시 True가 되게 해야 함
+    if(!text) return;
+    socket.emit('client_message', { uid: document.getElementById('user-role').value, text });
+    input.value = '';
+}
 
 
 
@@ -580,35 +623,42 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
 
 
-        socket.on('admin_auth_res', d => {
+       socket.on('admin_auth_res', d => {
+    if(d.success) {
+        // 1. 모달 띄우기
+        const modal = document.getElementById('admin-modal');
+        modal.style.display = 'flex';
 
-            if(d.success) document.getElementById('admin-modal').style.display = 'flex';
+        // 2. 모든 탭 숨기기 및 버튼 비활성화 (초기화)
+        document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+        document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
 
-            else alert("비밀번호 불일치");
+        // 3. 첫 번째 탭(시스템)만 강제로 켜기
+        document.getElementById('t-base').classList.add('active');
+        document.querySelector('.tab-btn').classList.add('active');
 
-        });
+        refreshUI(); // 저장된 데이터 다시 불러와서 칸 채우기
+    } else {
+        alert("비밀번호 불일치");
+    }
+});
 
 
 
         function saveMaster() {
+    // 마스터 창에 있는 모든 입력값을 긁어모아!
+    const masterData = {
+        title: document.getElementById('m-title').value,
+        sys: document.getElementById('m-sys').value,
+        pro: document.getElementById('m-pro').value,
+        sum: document.getElementById('m-sum').value,
+        model: document.getElementById('m-ai-model').value // 마스터 창의 엔진 선택값
+    };
 
-            socket.emit('save_master_base', {
-
-                title: document.getElementById('m-title').value,
-
-                sys: document.getElementById('m-sys').value,
-
-                pro: document.getElementById('m-pro').value,
-
-                sum: document.getElementById('m-sum').value
-
-            });
-
-            alert("시스템 설정 저장 완료.");
-
-            closeModal();
-
-        }
+    socket.emit('save_master_base', masterData);
+    alert("마스터 설정이 모두 저장되었어! 엔진이 " + masterData.model + "(으)로 교체됐어.");
+    closeModal();
+}
 
 
 
@@ -684,24 +734,22 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
 
 
-        function renderLore() {
+       function renderLore() {
+    const listDiv = document.getElementById('lore-list');
+    if(!gState || !gState.lorebook) return;
 
-            const listDiv = document.getElementById('lore-list');
+    listDiv.innerHTML = gState.lorebook.map((l, i) => `
+        <div style="padding:8px; background:rgba(0,0,0,0.03); margin-bottom:5px; border-radius:8px; display:flex; justify-content:space-between; align-items:center; border: 1px solid rgba(0,0,0,0.05);">
+            <span onclick="editLore(${i})" style="cursor:pointer; flex:1; font-size:13px;">
+                <b>${l.title}</b> <small style="color:#666;">(우선순위: ${l.priority})</small>
+            </span>
 
-            if(!gState || !gState.lorebook) return;
-
-            listDiv.innerHTML = gState.lorebook.map((l, i) => `
-
-                <div style="padding:8px; background:rgba(0,0,0,0.03); margin-bottom:5px; border-radius:8px; display:flex; justify-content:space-between; align-items:center; border: 1px solid rgba(0,0,0,0.05);">
-
-                    <span onclick="editLore(${i})" style="cursor:pointer; flex:1;"><b>${l.title}</b> <small>(${l.priority})</small></span>
-
-                    <button onclick="socket.emit('del_lore', {index:${i}})" style="padding:2px 8px; font-size:11px; background:#ff4444; color:white !important;">삭제</button>
-
-                </div>`).join('');
-
-        }
-
+            <div style="display:flex; gap:3px;">
+                <button onclick="editLore(${i})" style="padding:2px 8px; font-size:11px; background:#44aaff; color:white !important;">수정</button>
+                <button onclick="socket.emit('del_lore', {index:${i}})" style="padding:2px 8px; font-size:11px; background:#ff4444; color:white !important;">삭제</button>
+            </div>
+        </div>`).join('');
+}
 
 
         function openTab(evt, id) {
@@ -720,7 +768,37 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
         function closeModal() { document.getElementById('admin-modal').style.display='none'; }
 
-        function saveProfile() { socket.emit('update_profile', { uid: document.getElementById('user-role').value, name: document.getElementById('p-name').value, bio: document.getElementById('p-bio').value, canon: document.getElementById('p-canon').value }); alert("프로필 저장됨."); }
+        function saveProfile() {
+    const role = document.getElementById('user-role').value;
+    const name = document.getElementById('p-name').value;
+
+    if(!name || name.includes("Player")) {
+        return alert("캐릭터 이름을 먼저 입력해주세요!");
+    }
+
+    // [핵심] "못 바꿉니다" 경고창
+    const logic = `⚠️ 주의: 지금 설정한 내용으로 확정됩니다.\n세션이 시작된 후에는 내용을 수정할 수 없습니다.\n\n정말로 저장하시겠습니까?`;
+
+    if(confirm(logic)) {
+        const data = {
+            uid: role,
+            name: name,
+            bio: document.getElementById('p-bio').value,
+            canon: document.getElementById('p-canon').value
+        };
+
+        socket.emit('update_profile', data);
+
+        // 저장 후 입력창들 잠그기 (AI 혼란 방지)
+        document.getElementById('p-name').readOnly = true;
+        document.getElementById('p-bio').readOnly = true;
+        document.getElementById('p-canon').readOnly = true;
+        document.getElementById('ready-btn').disabled = true;
+        document.getElementById('ready-btn').innerText = "🔒 설정 고정됨";
+
+        alert("설정이 고정되었습니다. 상대방의 준비를 기다립니다.");
+    }
+}
 
         function sessionReset() { if(confirm("전체 초기화하시겠습니까?")) { const pw = prompt("관리자 비밀번호:"); if(pw) socket.emit('reset_session', { password: pw }); } }
 
@@ -736,6 +814,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
 </html>
 """
+
 # --- 7. 소켓 핸들러 (저장 로직 추가됨) ---
 #플레이어
 @socketio.on('lock_settings')
