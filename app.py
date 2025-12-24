@@ -1,50 +1,39 @@
 import os
 import json
-from flask import Flask, render_template_string
-from flask_socketio import SocketIO, emit
+import copy
+import re
+import sys
+from datetime import datetime
+from flask import Flask, render_template_string, request, Response
+from flask_socketio import SocketIO, emit, disconnect
 from pyngrok import ngrok
-from dotenv import load_dotenv
 import openai
+import google.generativeai as genai
 
-# 1. 환경 변수 로드
-load_dotenv()
+# Colab 환경인지 확인
+try:
+    from google.colab import drive
+    from google.colab import userdata
+    IS_COLAB = True
+except ImportError:
+    IS_COLAB = False
 
-# 2. 설정 값 가져오기
-OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
-NGROK_TOKEN = os.getenv('NGROK_AUTH_TOKEN')
-ADMIN_PASSWORD = os.getenv('ADMIN_PASSWORD', '3896')
+# =========================
+# Drive & Storage Config
+# =========================
+if IS_COLAB:
+    drive.mount('/content/drive')
+    SAVE_PATH = '/content/drive/MyDrive/ChatData'
+else:
+    # 로컬 실행 시 현재 폴더에 저장
+    SAVE_PATH = os.path.join(os.getcwd(), 'ChatData')
 
-client = openai.OpenAI(api_key=OPENAI_API_KEY)
-if NGROK_TOKEN:
-    ngrok.set_auth_token(NGROK_TOKEN)
-
-app = Flask(__name__)
-socketio = SocketIO(app, cors_allowed_origins="*")
-
-# 3. 데이터 저장 경로 설정
-SAVE_PATH = 'data'
-if not os.path.exists(SAVE_PATH):
-    os.makedirs(SAVE_PATH)
+os.makedirs(SAVE_PATH, exist_ok=True)
 DATA_FILE = os.path.join(SAVE_PATH, "save_data.json")
 
-# --- 전역 상태 변수 ---
-initial_state = {
-    "session_title": "드림놀이",
-    "theme": {"bg": "#ffffff", "panel": "#1a1a1f", "accent": "#e91e63"},
-    "accent_color": "#e91e63",
-    "admin_password": ADMIN_PASSWORD,
-    "is_locked": False,
-    "profiles": {
-        "user1": {"name": "Player 1", "bio": "", "canon": ""},
-        "user2": {"name": "Player 2", "bio": "", "canon": ""}
-    },
-    "ai_history": [],
-    "summary": "기록된 줄거리가 없습니다.",
-    "prologue": "프롤로그를 작성해주세요.",
-    "sys_prompt": "마스터 프롬프트",
-    "lorebook": [],
-    "examples": []
-}
+def save_data():
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
 
 def load_data():
     if os.path.exists(DATA_FILE):
@@ -55,595 +44,915 @@ def load_data():
             return None
     return None
 
+# =========================
+# Keys & AI setup
+# =========================
+gemini_model = None
+
+# API 키 가져오기 (Colab은 userdata, 로컬은 환경변수)
+def get_key(key_name):
+    if IS_COLAB:
+        try:
+            return userdata.get(key_name)
+        except:
+            return None
+    return os.environ.get(key_name)
+
+try:
+    NGROK_TOKEN = get_key('NGROK_AUTH_TOKEN')
+    OPENAI_API_KEY = get_key('OPENAI_API_KEY')
+    GEMINI_API_KEY = get_key('GEMINI_API_KEY')
+
+    if OPENAI_API_KEY:
+        client = openai.OpenAI(api_key=OPENAI_API_KEY)
+    else:
+        print("⚠️ OPENAI_API_KEY가 설정되지 않았습니다.")
+
+    if GEMINI_API_KEY:
+        genai.configure(api_key=GEMINI_API_KEY)
+        gemini_model = genai.GenerativeModel('gemini-1.5-pro-latest')
+    else:
+        print("⚠️ GEMINI_API_KEY가 설정되지 않았습니다.")
+
+    if NGROK_TOKEN:
+        ngrok.set_auth_token(NGROK_TOKEN)
+    else:
+        print("⚠️ NGROK_AUTH_TOKEN이 설정되지 않았습니다.")
+
+except Exception as e:
+    print(f"❌ 설정 오류: {e}")
+
+# =========================
+# App
+# =========================
+app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
+socketio = SocketIO(app, cors_allowed_origins="*")
+
+# =========================
+# State
+# =========================
+initial_state = {
+    "session_title": "드림놀이",
+    "theme": {"bg": "#ffffff", "panel": "#f1f3f5", "accent": "#e91e63"},
+    "ai_model": "gpt-4o",
+    "admin_password": "3896",
+
+    "solo_mode": False,
+    "session_started": False,
+
+    "profiles": {
+        "user1": {"name": "Player 1", "bio": "", "canon": "", "locked": False},
+        "user2": {"name": "Player 2", "bio": "", "canon": "", "locked": False}
+    },
+
+    "ai_history": [],
+    "summary": "",
+    "prologue": "",
+    "sys_prompt": "당신은 숙련된 TRPG 마스터입니다.",
+
+    "lorebook": [],
+    "examples": [{"q": "", "a": ""}, {"q": "", "a": ""}, {"q": "", "a": ""}]
+}
+
 saved_state = load_data()
-state = saved_state if saved_state else initial_state
+state = saved_state if isinstance(saved_state, dict) else copy.deepcopy(initial_state)
 
-def save_data():
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, indent=4)
+connected_users = {"user1": None, "user2": None}
+readonly_sids = set()
+admin_sids = set()
 
-# --- 테마 분석 로직 (gpt-5.2 -> gpt-4o 수정됨) ---
+# =========================
+# Helpers
+# =========================
+def sanitize_filename(name: str) -> str:
+    name = (name or "session").strip()
+    name = re.sub(r'[\\/:*?"<>|]+', "_", name)
+    name = re.sub(r"\s+", "_", name)
+    return name[:60] or "session"
+
+def get_export_config_only():
+    return {
+        "session_title": state.get("session_title", ""),
+        "sys_prompt": state.get("sys_prompt", ""),
+        "prologue": state.get("prologue", ""),
+        "ai_model": state.get("ai_model", "gpt-4o"),
+        "examples": state.get("examples", [{"q":"","a":""},{"q":"","a":""},{"q":"","a":""}]),
+        "lorebook": state.get("lorebook", []),
+        "solo_mode": bool(state.get("solo_mode", False)),
+        "_export_type": "dream_config_only_v1"
+    }
+
+def import_config_only(data: dict):
+    allow = {"session_title","sys_prompt","prologue","ai_model","examples","lorebook","solo_mode"}
+    for k in allow:
+        if k in data:
+            state[k] = copy.deepcopy(data[k])
+
+def get_sanitized_state(role: str = None):
+    safe = copy.deepcopy(state)
+    safe["profiles"]["user1"]["bio"] = ""
+    safe["profiles"]["user1"]["canon"] = ""
+    safe["profiles"]["user2"]["bio"] = ""
+    safe["profiles"]["user2"]["canon"] = ""
+    return safe
+
+def emit_state_to_players():
+    save_data()
+    payload = get_sanitized_state()
+    if connected_users["user1"]:
+        socketio.emit("initial_state", payload, room=connected_users["user1"])
+    if connected_users["user2"]:
+        socketio.emit("initial_state", payload, room=connected_users["user2"])
+
 def analyze_theme_color(title, sys_prompt):
     try:
-        response = client.chat.completions.create(
-            model="gpt-4o",  # 모델명 수정 완료
-            messages=[{
-                "role": "system",
-                "content": "모든 글씨는 검은색이므로, 배경(bg)과 패널(panel)은 반드시 글씨가 잘 보이는 밝은 파스텔톤이나 밝은 회색 계열로 골라야 해. JSON 형식: {\"bg\": \"색상\", \"panel\": \"색상\", \"accent\": \"색상\"}"
-            }, {
-                "role": "user",
-                "content": f"제목: {title}\n설정: {sys_prompt}"
-            }],
-            response_format={ "type": "json_object" }
+        res = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role":"system","content":"웹 UI 컬러 팔레트 전문가입니다. 반드시 JSON으로만 답변하세요: {\"bg\":\"#RRGGBB\",\"panel\":\"#RRGGBB\",\"accent\":\"#RRGGBB\"}"},
+                {"role":"user","content":f"세션 제목: {title}\n시스템 프롬프트 요약: {sys_prompt[:800]}"}
+            ],
+            response_format={"type":"json_object"}
         )
-        palette = json.loads(response.choices[0].message.content)
-        return palette
+        obj = json.loads(res.choices[0].message.content)
+        out = state.get("theme", {"bg":"#ffffff","panel":"#f1f3f5","accent":"#e91e63"})
+        for k in ("bg","panel","accent"):
+            if isinstance(obj.get(k), str) and obj[k].startswith("#"):
+                out[k] = obj[k]
+        return out
     except:
-        return {"bg": "#ffffff", "panel": "#f1f3f5", "accent": "#e91e63"}
+        return state.get("theme", {"bg":"#ffffff","panel":"#f1f3f5","accent":"#e91e63"})
 
-# --- HTML 템플릿 (JS 함수명 수정됨) ---
-HTML_TEMPLATE = """<!DOCTYPE html>
+# AI 기억력 최대화
+MAX_CONTEXT_CHARS_BUDGET = 14000
+HISTORY_SOFT_LIMIT_CHARS = 9500
+SUMMARY_MAX_CHARS = 500
+
+def build_history_block():
+    history = state.get("ai_history", [])
+    collected = []
+    total = 0
+    for msg in reversed(history):
+        add_len = len(msg) + 1
+        if total + add_len > HISTORY_SOFT_LIMIT_CHARS:
+            break
+        collected.append(msg)
+        total += add_len
+    collected.reverse()
+    return collected
+
+def would_overflow_context(extra_incoming: str) -> bool:
+    sys_p = state.get("sys_prompt","")
+    pro = state.get("prologue","")
+    summ = state.get("summary","")
+    hist = "\n".join(build_history_block())
+    rough = len(sys_p) + len(pro) + len(summ) + len(hist) + len(extra_incoming) + 2000
+    return rough > MAX_CONTEXT_CHARS_BUDGET
+
+def auto_summary_apply():
+    def run_once():
+        recent_log = "\n".join(state.get("ai_history", [])[-60:])
+        if not recent_log:
+            return None
+        prompt = (
+            "당신은 TRPG 진행 보조 AI입니다.\n"
+            "아래 최근 대화를 바탕으로 '현재 상황 요약'을 2~3문장으로 작성해 주세요.\n"
+            "사실/행동/목표 중심으로 간결하게 작성해 주세요.\n\n"
+            f"[최근 대화]\n{recent_log}"
+        )
+        res = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role":"user","content":prompt}]
+        )
+        return (res.choices[0].message.content or "").strip()
+
+    try:
+        s = run_once() or run_once()
+        if s:
+            state["summary"] = s[:SUMMARY_MAX_CHARS]
+            save_data()
+    except Exception as e:
+        print("AutoSummaryError:", e)
+
+# =========================
+# Routes
+# =========================
+@app.route("/")
+def index():
+    return render_template_string(HTML_TEMPLATE, theme=state.get("theme"))
+
+@app.route("/export")
+def export_config():
+    cfg = get_export_config_only()
+    ts = datetime.now().strftime("%Y%m%d_%H%M")
+    fname = f"{sanitize_filename(cfg.get('session_title'))}_{ts}.json"
+    return Response(
+        json.dumps(cfg, ensure_ascii=False, indent=2),
+        mimetype="application/json",
+        headers={"Content-Disposition": f"attachment;filename={fname}"}
+    )
+
+@app.route("/import", methods=["POST"])
+def import_config():
+    try:
+        if "file" not in request.files:
+            return "파일이 없습니다.", 400
+        file = request.files["file"]
+        if file.filename == "":
+            return "선택된 파일이 없습니다.", 400
+        data = json.load(file)
+        if not isinstance(data, dict):
+            return "올바른 JSON이 아닙니다.", 400
+
+        import_config_only(data)
+        save_data()
+        emit_state_to_players()
+        socketio.emit("reload_signal")
+        return "OK", 200
+    except Exception as e:
+        return str(e), 500
+
+# =========================
+# Socket: join / role
+# =========================
+@socketio.on("join_game")
+def join_game(_=None):
+    sid = request.sid
+    for role, rsid in connected_users.items():
+        if rsid == sid:
+            emit("assign_role", {"role": role, "mode": "player"})
+            emit("initial_state", get_sanitized_state(role))
+            return
+
+    if connected_users["user1"] is None:
+        connected_users["user1"] = sid
+        emit("assign_role", {"role": "user1", "mode": "player"})
+        emit("initial_state", get_sanitized_state())
+        return
+
+    if connected_users["user2"] is None:
+        connected_users["user2"] = sid
+        emit("assign_role", {"role": "user2", "mode": "player"})
+        emit("initial_state", get_sanitized_state())
+        return
+
+    readonly_sids.add(sid)
+    emit("assign_role", {"role": "readonly", "mode": "readonly"})
+    emit("initial_state", {"session_title": state.get("session_title","드림놀이"), "theme": state.get("theme")})
+
+@socketio.on("disconnect")
+def on_disconnect():
+    sid = request.sid
+    admin_sids.discard(sid)
+    for role in ("user1","user2"):
+        if connected_users[role] == sid:
+            connected_users[role] = None
+    readonly_sids.discard(sid)
+
+@socketio.on("check_admin")
+def check_admin(data):
+    ok = str(data.get("password")) == str(state.get("admin_password"))
+    if ok:
+        admin_sids.add(request.sid)
+    emit("admin_auth_res", {"success": ok})
+
+@socketio.on("save_master_base")
+def save_master_base(data):
+    state["session_title"] = (data.get("title", state["session_title"]) or "")[:30]
+    state["sys_prompt"] = (data.get("sys", state["sys_prompt"]) or "")[:4000]
+    state["prologue"] = (data.get("pro", state["prologue"]) or "")[:1000]
+    state["summary"] = (data.get("sum", state["summary"]) or "")[:SUMMARY_MAX_CHARS]
+    state["ai_model"] = data.get("model", state.get("ai_model","gpt-4o"))
+    state["solo_mode"] = bool(data.get("solo_mode", state.get("solo_mode", False)))
+    save_data()
+    emit_state_to_players()
+
+@socketio.on("theme_analyze_request")
+def theme_analyze_request(_=None):
+    if not (state.get("sys_prompt","").strip() and state.get("prologue","").strip()):
+        return
+    new_theme = analyze_theme_color(state.get("session_title",""), state.get("sys_prompt",""))
+    state["theme"] = new_theme
+    save_data()
+    emit_state_to_players()
+    socketio.emit("reload_signal")
+
+@socketio.on("save_examples")
+def save_examples(data):
+    out = []
+    for i in range(3):
+        ex = data[i] if i < len(data) else {"q":"","a":""}
+        out.append({"q": (ex.get("q","") or "")[:500], "a": (ex.get("a","") or "")[:500]})
+    state["examples"] = out
+    save_data()
+    emit_state_to_players()
+
+@socketio.on("update_profile")
+def update_profile(data):
+    uid = data.get("uid")
+    if uid not in ("user1","user2"): return
+    if connected_users.get(uid) != request.sid: return
+    if state["profiles"][uid].get("locked"): return
+
+    name = (data.get("name") or "").strip()
+    if not name: return
+
+    state["profiles"][uid]["name"] = name[:12]
+    state["profiles"][uid]["bio"] = (data.get("bio") or "")[:200]
+    state["profiles"][uid]["canon"] = (data.get("canon") or "")[:350]
+    state["profiles"][uid]["locked"] = True
+
+    save_data()
+    emit_state_to_players()
+
+@socketio.on("start_session")
+def start_session(_=None):
+    if request.sid not in admin_sids:
+        emit("status_update", {"msg": "⚠️ 세션 시작은 마스터만 가능합니다."})
+        return
+    if state.get("session_started"):
+        emit("status_update", {"msg": "ℹ️ 세션은 이미 시작된 상태입니다."})
+        return
+
+    if state.get("solo_mode"):
+        if not state["profiles"]["user1"].get("locked"):
+            emit("status_update", {"msg": "⚠️ 1인 모드에서는 Player 1의 프로필 저장(확정)이 필요합니다."})
+            return
+        state["session_started"] = True
+    else:
+        p1_locked = bool(state["profiles"]["user1"].get("locked"))
+        p2_locked = bool(state["profiles"]["user2"].get("locked"))
+        if not p1_locked and not p2_locked:
+            emit("status_update", {"msg": "⚠️ Player 1과 Player 2 모두 프로필 저장(확정)이 필요합니다."})
+            return
+        if not p1_locked:
+            emit("status_update", {"msg": "⚠️ Player 1의 프로필 저장(확정)이 필요합니다."})
+            return
+        if not p2_locked:
+            emit("status_update", {"msg": "⚠️ Player 2의 프로필 저장(확정)이 필요합니다."})
+            return
+        state["session_started"] = True
+
+    save_data()
+    emit_state_to_players()
+    emit("status_update", {"msg": "✅ 세션이 시작되었습니다."}, broadcast=True)
+
+@socketio.on("add_lore")
+def add_lore(data):
+    idx = int(data.get("index", -1))
+    title = (data.get("title","") or "")[:10]
+    triggers = (data.get("triggers","") or "")
+    content = (data.get("content","") or "")[:400]
+    item = {"title": title, "triggers": triggers, "content": content}
+    state.setdefault("lorebook", [])
+    if 0 <= idx < len(state["lorebook"]):
+        state["lorebook"][idx] = item
+    else:
+        state["lorebook"].append(item)
+    save_data()
+    emit_state_to_players()
+
+@socketio.on("del_lore")
+def del_lore(data):
+    try:
+        state["lorebook"].pop(int(data.get("index")))
+        save_data()
+        emit_state_to_players()
+    except: pass
+
+@socketio.on("reorder_lore")
+def reorder_lore(data):
+    try:
+        f = int(data.get("from"))
+        t = int(data.get("to"))
+        lb = state.get("lorebook", [])
+        if 0 <= f < len(lb) and 0 <= t < len(lb):
+            item = lb.pop(f)
+            lb.insert(t, item)
+            save_data()
+            emit_state_to_players()
+    except: pass
+
+@socketio.on("reset_session")
+def reset_session(data):
+    if str(data.get("password")) != str(state.get("admin_password")):
+        emit("status_update", {"msg": "❌ 비밀번호가 일치하지 않습니다."})
+        return
+    state["ai_history"] = []
+    state["lorebook"] = []
+    state["summary"] = ""
+    state["session_started"] = False
+    state["profiles"]["user1"]["locked"] = False
+    state["profiles"]["user2"]["locked"] = False
+    save_data()
+    emit_state_to_players()
+
+@socketio.on("client_message")
+def client_message(data):
+    uid = data.get("uid")
+    user_text = (data.get("text") or "").strip()
+
+    if uid not in ("user1","user2"): return
+    if connected_users.get(uid) != request.sid: return
+    if not state.get("session_started", False):
+        emit("status_update", {"msg": "⚠️ 세션이 아직 시작되지 않았습니다."})
+        return
+
+    user_text = user_text[:600]
+
+    # 컨텍스트 예산 확인
+    extra_incoming = user_text + "\n".join(build_history_block())
+    if would_overflow_context(extra_incoming):
+        auto_summary_apply()
+
+    active_context = []
+    for l in state.get("lorebook", []):
+        triggers = [t.strip() for t in (l.get("triggers","")).split(",") if t.strip()]
+        if any(t in user_text for t in triggers):
+            active_context.append(f"[{l.get('title','')}]: {l.get('content','')}")
+    active_context = active_context[:3]
+
+    profile = state["profiles"].get(uid, {})
+    p_name = profile.get("name", uid)
+
+    system_content = (
+        f"{state.get('sys_prompt','')}\n\n"
+        f"[현재 상황 요약]\n{state.get('summary','')}\n\n"
+        f"[키워드 참고]\n" + "\n".join(active_context)
+    )
+
+    messages = [{"role":"system","content":system_content}]
+    for ex in state.get("examples", []):
+        if ex.get("q") and ex.get("a"):
+            messages.append({"role":"user","content":ex["q"]})
+            messages.append({"role":"assistant","content":ex["a"]})
+
+    for h in build_history_block():
+        messages.append({"role": "assistant" if h.startswith("**AI**") else "user", "content": h})
+
+    messages.append({"role":"user","content": f"{p_name}: {user_text}"})
+
+    try:
+        current_model = state.get("ai_model","gpt-4o")
+        emit("status_update", {"msg": f"🤔 {current_model} 응답 생성 중..."}, broadcast=True)
+
+        if "gemini" in current_model.lower():
+            if gemini_model is None: raise Exception("Gemini API 키 오류")
+            prompt = system_content + "\n" + "\n".join(build_history_block()) + f"\n{p_name}: {user_text}\nAI:"
+            res = genai.GenerativeModel(current_model).generate_content(prompt)
+            ai_response = res.text
+        else:
+            res = client.chat.completions.create(model=current_model, messages=messages)
+            ai_response = res.choices[0].message.content
+
+        state["ai_history"].append(f"**{p_name}**: {user_text}")
+        state["ai_history"].append(f"**AI**: {ai_response}")
+
+        save_data()
+        emit_state_to_players()
+
+    except Exception as e:
+        emit("status_update", {"msg": f"❌ 오류: {str(e)}"}, broadcast=True)
+
+HTML_TEMPLATE = r"""
+<!DOCTYPE html>
 <html>
 <head>
-    <meta charset="UTF-8">
-    <title>드림놀이</title>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
-    <style>
-        :root {
-            --bg: {{ theme.bg if theme else '#ffffff' }};
-            --panel: {{ theme.panel if theme else '#f1f3f5' }};
-            --accent: {{ theme.accent if theme else '#e91e63' }};
-            --text: #000000;
-        }
-        html, body { height: 100%; margin: 0; overflow: hidden; }
-        body { font-family: 'Pretendard', sans-serif; display: flex; background: var(--bg); color: #000000 !important; }
-        div, p, span, h1, h2, h3, h4, input, textarea, select, button, .bubble { color: #000000 !important; }
-        
-        #main { flex: 1; display: flex; flex-direction: column; height: 100vh; border-right: 1px solid rgba(0,0,0,0.05); }
-        #chat-window { flex: 1; overflow-y: auto; padding: 30px 10%; display: flex; flex-direction: column; gap: 15px; scroll-behavior: smooth; }
-        #sidebar { width: 320px; height: 100vh; background: var(--panel); padding: 20px; box-sizing: border-box; overflow-y: auto; display: flex; flex-direction: column; gap: 12px; }
-
-        textarea, input, select {
-            background: var(--bg) !important;
-            border: 1px solid rgba(0, 0, 0, 0.1) !important;
-            border-radius: 10px; padding: 10px; width: 100%; box-sizing: border-box;
-            transition: all 0.2s ease; resize: none !important;
-        }
-        #msg-input { background: var(--panel) !important; border: 1px solid rgba(0, 0, 0, 0.15) !important; height: 80px; }
-        textarea:focus, input:focus { outline: none; border-color: var(--accent) !important; box-shadow: 0 0 5px rgba(0,0,0,0.05); }
-
-        .bubble { padding: 15px 20px; border-radius: 15px; max-width: 85%; line-height: 1.6; font-size: 14px; white-space: pre-wrap; background: rgba(0,0,0,0.03); }
-        .center-ai { align-self: center; background: var(--panel) !important; border-left: 5px solid var(--accent); width: 100%; max-width: 800px; box-shadow: 0 4px 15px rgba(0,0,0,0.05); }
-        .user-bubble { align-self: flex-end; border-right: 5px solid var(--accent); background: var(--bg); }
-
-        button { cursor: pointer; border: none; border-radius: 8px; background: var(--accent); padding: 10px; font-weight: bold; transition: 0.2s; }
-        button:hover { opacity: 0.8; }
-        .btn-reset { background: #ff4444 !important; color: #ffffff !important; margin-top: 20px; }
-
-        #admin-modal {
-            display: none; position: fixed; z-index: 10000; left: 0; top: 0;
-            width: 100vw; height: 100vh; background: rgba(0, 0, 0, 0.6);
-            backdrop-filter: blur(5px); align-items: center; justify-content: center;
-        }
-        .modal-content {
-            width: 95%; max-width: 1200px; height: 85vh; background: #ffffff;
-            border-radius: 16px; display: flex; flex-direction: column;
-            box-shadow: 0 20px 60px rgba(0,0,0,0.3); overflow: hidden;
-        }
-        .modal-header {
-            height: 60px; display: flex; justify-content: space-between; align-items: center;
-            padding: 0 25px; background: #f8f9fa; border-bottom: 1px solid #eee;
-        }
-        .tab-group { display: flex; height: 100%; gap: 10px; }
-        .tab-btn {
-            border: none; background: none; padding: 0 15px; font-size: 14px; font-weight: 600; color: #777;
-            cursor: pointer; position: relative; transition: 0.2s;
-        }
-        .tab-btn.active { color: var(--accent); }
-        .tab-btn.active::after {
-            content: ""; position: absolute; bottom: 0; left: 0; width: 100%; height: 3px; background: var(--accent);
-        }
-        .close-btn { width: 32px; height: 32px; border-radius: 50%; border: none; background: #eee; cursor: pointer; font-size: 16px; }
-        .modal-body { flex: 1; display: flex; overflow: hidden; }
-        .tab-content { display: none; width: 100%; height: 100%; flex-direction: row; }
-        .tab-content.active { display: flex; }
-        .editor-side { flex: 1.3; padding: 25px; display: flex; flex-direction: column; gap: 15px; overflow-y: auto; border-right: 1px solid #f0f0f0; }
-        .list-side { flex: 0.7; padding: 25px; background: #fafafa; display: flex; flex-direction: column; gap: 15px; overflow-y: auto; }
-        
-        .editor-side label, .list-side label { font-size: 12px; font-weight: 800; color: #999; text-transform: uppercase; }
-        .editor-side input, .editor-side select, .editor-side textarea, .list-side textarea {
-            width: 100%; border: 1px solid #ddd; border-radius: 8px; padding: 12px; font-size: 14px; font-family: inherit; background: #fff !important;
-        }
-        .editor-side textarea { flex: 1; min-height: 200px; resize: none; }
-        .list-side textarea { height: 100%; resize: none; }
-        .save-btn { background: var(--accent); color: white !important; padding: 15px; border-radius: 10px; font-weight: bold; cursor: pointer; border: none; margin-top: 5px; }
-    </style>
+  <meta charset="UTF-8">
+  <title>드림놀이</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/sortablejs@1.15.2/Sortable.min.js"></script>
+  <style>
+    :root{ --bg: {{ theme.bg if theme else '#ffffff' }}; --panel: {{ theme.panel if theme else '#f1f3f5' }}; --accent: {{ theme.accent if theme else '#e91e63' }}; }
+    html,body{height:100%;margin:0;overflow:hidden;}
+    body{font-family:Pretendard,sans-serif;display:flex;background:var(--bg);color:#000;}
+    #main{flex:1;display:flex;flex-direction:column;height:100vh;border-right:1px solid rgba(0,0,0,0.05);min-width:0;}
+    #chat-window{flex:1;overflow-y:auto;padding:30px 10%;display:flex;flex-direction:column;gap:15px;}
+    #chat-content{display:flex;flex-direction:column;gap:15px;}
+    #sidebar{width:320px;height:100vh;background:var(--panel);display:flex;flex-direction:column;overflow:hidden;}
+    #sidebar-body{padding:20px;overflow-y:auto;flex:1;min-height:0;display:flex;flex-direction:column;gap:12px;}
+    #sidebar-footer{padding:12px 20px 16px;border-top:1px solid rgba(0,0,0,0.06);background:var(--panel);}
+    textarea,input,select{background:var(--bg)!important;border:1px solid rgba(0,0,0,0.1)!important;border-radius:10px;padding:10px;width:100%;box-sizing:border-box;resize:none!important;}
+    #msg-input{background:var(--panel)!important;border:1px solid rgba(0,0,0,0.15)!important;height:80px;}
+    button{cursor:pointer;border:none;border-radius:8px;background:var(--accent);padding:10px;font-weight:bold;color:#fff;}
+    button:hover{opacity:.85;}
+    .btn-reset{background:#ff4444!important;}
+    .master-btn{width:100%;background:transparent!important;color:#999!important;border:1px solid #ddd!important;padding:10px!important;border-radius:10px;font-weight:800;}
+    .bubble{padding:15px 20px;border-radius:15px;max-width:85%;line-height:1.6;font-size:14px;white-space:pre-wrap;background:rgba(0,0,0,0.03);}
+    .center-ai{align-self:center;background:var(--panel)!important;border-left:5px solid var(--accent);width:100%;max-width:800px;box-shadow:0 4px 15px rgba(0,0,0,0.05);}
+    .user-bubble{align-self:flex-end;border-right:5px solid var(--accent);background:var(--bg);}
+    .name-tag{font-size:11px;color:#666;margin-bottom:6px;font-weight:700;}
+    /* modal */
+    #admin-modal{display:none;position:fixed;z-index:10000;left:0;top:0;width:100vw;height:100vh;background:rgba(0,0,0,0.6);backdrop-filter:blur(5px);align-items:center;justify-content:center;padding:24px;box-sizing:border-box;}
+    .modal-content{width:100%;max-width:1200px;height:min(85vh,900px);background:#fff;border-radius:16px;display:flex;flex-direction:column;overflow:hidden;min-height:0;box-shadow:0 20px 60px rgba(0,0,0,0.3);}
+    .modal-header{height:60px;flex:0 0 60px;display:flex;justify-content:space-between;align-items:center;padding:0 20px;background:#f8f9fa;border-bottom:1px solid #eee;box-sizing:border-box;}
+    .tab-group{display:flex;gap:10px;height:100%;align-items:center;}
+    .tab-btn{border:none;background:none!important;padding:0 14px;height:100%;font-size:14px;font-weight:700;color:#777;cursor:pointer;position:relative;}
+    .tab-btn.active{color:var(--accent);}
+    .tab-btn.active::after{content:"";position:absolute;bottom:0;left:0;width:100%;height:3px;background:var(--accent);}
+    .close-btn{width:32px;height:32px;border-radius:50%;border:none;background:#eee;color:#000;font-size:16px;font-weight:800;cursor:pointer;padding:0;}
+    .modal-body{flex:1;display:flex;overflow:hidden;min-height:0;}
+    .tab-content{display:none;width:100%;height:100%;flex-direction:row;min-height:0;}
+    .tab-content.active{display:flex;}
+    .editor-side{flex:1.25;padding:20px;display:flex;flex-direction:column;gap:12px;overflow-y:auto;border-right:1px solid #f0f0f0;min-height:0;box-sizing:border-box;}
+    .list-side{flex:.75;padding:20px;background:#fafafa;display:flex;flex-direction:column;gap:12px;overflow-y:auto;min-height:0;box-sizing:border-box;}
+    .editor-side label,.list-side label{font-size:12px;font-weight:800;color:#999;text-transform:uppercase;}
+    .save-btn{background:var(--accent);color:#fff;padding:14px;border-radius:10px;font-weight:800;border:none;}
+    .fill-textarea{flex:1;min-height:260px;}
+    .short-textarea{flex:none;height:120px;}
+    .ex-block{background:#fff;border:1px solid #eee;padding:12px;border-radius:10px;display:flex;flex-direction:column;gap:8px;}
+    .ex-block textarea{background:#fff!important;border:1px solid #ddd!important;border-radius:8px;padding:10px;font-size:13px;width:100%;height:80px;box-sizing:border-box;}
+    #tag-container{display:flex;flex-wrap:wrap;gap:8px;padding:10px;border:1px solid rgba(0,0,0,0.12);border-radius:10px;background:var(--bg);align-items:center;min-height:44px;box-sizing:border-box;}
+    .tag-chip{display:inline-flex;align-items:center;gap:6px;padding:6px 10px;border-radius:999px;background:rgba(0,0,0,0.06);border:1px solid rgba(0,0,0,0.08);font-size:12px;font-weight:700;user-select:none;}
+    .tag-chip button{background:transparent!important;border:none;padding:0;cursor:pointer;color:#444;font-weight:900;}
+    #tag-input{border:none!important;outline:none!important;background:transparent!important;width:220px!important;min-width:120px;padding:6px 8px!important;}
+    .lore-row{display:flex;align-items:center;gap:8px;padding:6px 8px;border-radius:10px;background:rgba(0,0,0,0.03);border:1px solid rgba(0,0,0,0.06);}
+    .drag-handle{cursor:grab;color:#999;font-size:16px;user-select:none;}
+    .lore-main{flex:1;min-width:0;}
+    .lore-title{font-weight:800;font-size:13px;}
+    .lore-trg{font-size:11px;color:#666;}
+    .lore-actions{display:flex;gap:6px;}
+    .mini-btn{padding:3px 7px;font-size:11px;border-radius:8px;}
+    .mini-edit{background:#44aaff!important;}
+    .mini-del{background:#ff4444!important;}
+    .content-span { pointer-events: none; }
+    .btn-group button { pointer-events: auto; }
+  </style>
 </head>
 <body>
-    <div id="main">
-        <div id="chat-window"><div id="chat-content"></div></div>
-        <div id="input-area" style="padding:20px; background: var(--bg);">
-            <div id="status" style="font-size: 12px; margin-bottom: 5px; color: var(--accent); font-weight: bold;">대기 중</div>
-            <div style="display:flex; gap:10px;">
-                <textarea id="msg-input" placeholder="설정 완료 후 잠금 버튼을 눌러주세요."></textarea>
-                <button onclick="send()" style="width:80px;">전송</button>
-            </div>
+  <div id="main">
+    <div id="chat-window"><div id="chat-content"></div></div>
+    <div id="input-area" style="padding:20px;background:var(--bg);">
+      <div id="status" style="font-size:12px;margin-bottom:5px;color:var(--accent);font-weight:bold;">대기 중</div>
+      <div style="display:flex;gap:10px;">
+        <textarea id="msg-input" maxlength="600" placeholder="메시지를 입력하세요..."></textarea>
+        <button onclick="send()" style="width:80px;">전송</button>
+      </div>
+    </div>
+  </div>
+  <div id="sidebar">
+    <div id="sidebar-body">
+      <h3>설정</h3>
+      <div id="role-display" style="padding:10px;background:rgba(0,0,0,0.05);border-radius:8px;font-weight:800;color:#555;">접속 중...</div>
+      <input type="hidden" id="user-role" value="">
+      <input type="text" id="p-name" maxlength="12" placeholder="이름">
+      <textarea id="p-bio" maxlength="200" style="height:120px;" placeholder="캐릭터 설정(최대 200자)"></textarea>
+      <textarea id="p-canon" maxlength="350" style="height:80px;" placeholder="관계 설정(최대 350자)"></textarea>
+      <button onclick="saveProfile()" id="ready-btn">설정 저장</button>
+      <div id="ready-status" style="font-size:11px;margin-top:5px;color:#666;">대기 중입니다...</div>
+    </div>
+    <div id="sidebar-footer"><button class="master-btn" onclick="requestAdmin()">마스터 설정</button></div>
+  </div>
+  <div id="admin-modal">
+    <div class="modal-content">
+      <div class="modal-header">
+        <div class="tab-group">
+          <button class="tab-btn active" onclick="openTab(event,'t-base')">엔진</button>
+          <button class="tab-btn" onclick="openTab(event,'t-story')">서사</button>
+          <button class="tab-btn" onclick="openTab(event,'t-ex')">학습</button>
+          <button class="tab-btn" onclick="openTab(event,'t-lore')">키워드</button>
         </div>
-    </div>
-
-    <div id="sidebar">
-        <h3>🎭 설정</h3>
-        <select id="user-role" onchange="refreshUI()">
-            <option value="user1">Player 1</option>
-            <option value="user2">Player 2</option>
-        </select>
-        <input type="text" id="p-name" placeholder="이름">
-        <textarea id="p-bio" style="height:120px;" placeholder="캐릭터 설정"></textarea>
-        <textarea id="p-canon" style="height:80px;" placeholder="관계 설정"></textarea>
-        
-        <button onclick="saveProfile()" id="ready-btn" style="background:var(--accent); color:white !important;">
-            ✅ 설정 저장 및 준비 완료
-        </button>
-        <div id="ready-status" style="font-size:11px; margin-top:5px; color:#666;">대기 중...</div>
-        <div style="flex: 1;"></div>
-        <button onclick="requestAdmin()" style="background:transparent; color:#999 !important; border: 1px solid #ddd;">⚙️ 마스터 설정 </button>
-    </div>
-
-    <div id="admin-modal">
-        <div class="modal-content">
-            <div class="modal-header">
-                <div class="tab-group">
-                    <button class="tab-btn active" onclick="openTab(event, 't-base')">⚙️ 엔진</button>
-                    <button class="tab-btn" onclick="openTab(event, 't-story')">🎬 서사</button>
-                    <button class="tab-btn" onclick="openTab(event, 't-ex')">💡 학습</button>
-                    <button class="tab-btn" onclick="openTab(event, 't-lore')">📚 키워드</button>
-                </div>
-                <button onclick="closeModal()" class="close-btn">✕</button>
+        <button onclick="closeModal(true)" class="close-btn">✕</button>
+      </div>
+      <div class="modal-body">
+        <div id="t-base" class="tab-content active">
+          <div class="editor-side">
+            <label>AI 모델 선택</label>
+            <select id="m-ai-model">
+              <option value="gpt-4o">OpenAI GPT-4o</option>
+              <option value="gpt-5.2">OpenAI GPT-5.2</option>
+              <option value="gemini-1.5-pro-latest">Google Gemini 1.5 Pro</option>
+            </select>
+            <label>시스템 프롬프트 (최대 4000자)</label>
+            <textarea id="m-sys" class="fill-textarea" maxlength="4000"></textarea>
+            <label>1인 플레이 모드 (테스트용)</label>
+            <select id="m-solo">
+              <option value="false">사용 안 함(2인)</option>
+              <option value="true">사용(1인)</option>
+            </select>
+            <button onclick="saveMaster()" class="save-btn">저장</button>
+            <button id="start-session-btn" onclick="startSession()" class="save-btn" style="background:#444!important;display:none;">세션 시작</button>
+          </div>
+          <div class="list-side">
+            <label>세션 설정 백업/복원(설정만)</label>
+            <div style="display:flex;gap:6px;">
+              <a href="/export" target="_blank" style="flex:1;"><button style="width:100%;background:#444!important;" class="mini-btn">백업 저장</button></a>
+              <button onclick="document.getElementById('import-file').click()" style="flex:1;background:#666!important;" class="mini-btn">복원</button>
+              <input type="file" id="import-file" style="display:none;" accept=".json" onchange="uploadSessionFile(this)">
             </div>
-            <div class="modal-body">
-                <div id="t-base" class="tab-content active">
-                    <div class="editor-side">
-                        <label>AI 모델 선택</label>
-                        <select id="m-ai-model">
-                            <option value="gpt-4o">OpenAI GPT-4o</option>
-                            <option value="gpt-4-turbo">OpenAI GPT-4 Turbo</option>
-                        </select>
-                        <label>시스템 프롬프트 (AI 지침)</label>
-                        <textarea id="m-sys" placeholder="AI에게 줄 지침..."></textarea>
-                        <button onclick="saveMaster()" class="save-btn">💾 엔진 설정 저장</button>
-                    </div>
-                    <div class="list-side">
-                        <label>안내</label>
-                        <p style="font-size:13px; color:#666;">엔진 모델과 전체적인 AI의 페르소나를 결정합니다.</p>
-                        <button class="btn-reset" onclick="sessionReset()" style="margin-top: auto;">⚠️ 세션 완전 초기화</button>
-                    </div>
-                </div>
-                <div id="t-story" class="tab-content">
-                    <div class="editor-side">
-                        <label>🏷️ 세션 제목</label>
-                        <input type="text" id="m-title" placeholder="제목">
-                        <label>📌 현재 상황 요약</label>
-                        <textarea id="m-sum" style="height:100px; flex:none;" placeholder="지금까지의 핵심 내용..."></textarea>
-                        <label>📖 프롤로그</label>
-                        <textarea id="m-pro" placeholder="이야기의 시작..."></textarea>
-                        <button onclick="saveMaster()" class="save-btn">💾 모든 서사 저장</button>
-                    </div>
-                    <div class="list-side">
-                        <label>💡 서사 팁</label>
-                        <p style="font-size:13px; color:#666;">서사는 AI가 이야기의 맥락을 파악하는 데 가장 중요한 정보야.</p>
-                    </div>
-                </div>
-                <div id="t-ex" class="tab-content">
-                    <div class="editor-side">
-                        <label>💡 학습 데이터 (대화 예시)</label>
-                        <textarea id="ex-data" placeholder="[User]: 안녕!&#10;[AI]: 반가워요! (JSON 형태로 처리 권장)"></textarea>
-                        <button onclick="saveExamples()" class="save-btn">💡 학습 데이터 저장</button>
-                    </div>
-                    <div class="list-side"><label>도움말</label><p style="font-size:12px;">원하는 말투를 직접 적어줘.</p></div>
-                </div>
-                <div id="t-lore" class="tab-content">
-                    <div class="editor-side">
-                        <label>🔍 키워드 이름</label>
-                        <input type="text" id="kw-t" placeholder="이름">
-                        <label>🎯 트리거 (쉼표로 구분)</label>
-                        <input type="text" id="kw-tr" placeholder="태그1, 태그2...">
-                        <label>📝 상세 설정</label>
-                        <textarea id="kw-c" placeholder="AI에게 전달할 설정 내용..."></textarea>
-                        <input type="number" id="kw-p" value="0" placeholder="우선순위">
-                        <button onclick="addLore()" class="save-btn">➕ 키워드 저장</button>
-                    </div>
-                    <div class="list-side">
-                        <label>📋 저장된 키워드</label>
-                        <div id="lore-list" style="flex: 1; overflow-y: auto; display:flex; flex-direction:column; gap:8px;"></div>
-                    </div>
-                </div>
-            </div>
+            <textarea id="m-sum" class="short-textarea" maxlength="500" placeholder="현재 상황 요약(내부 기억용)"></textarea>
+            <button class="btn-reset" onclick="sessionReset()" style="margin-top:auto;">세션 초기화</button>
+          </div>
         </div>
+        <div id="t-story" class="tab-content">
+          <div class="editor-side">
+            <label>세션 제목 (최대 30자)</label>
+            <input type="text" id="m-title" maxlength="30">
+            <label>프롤로그 (최대 1000자)</label>
+            <textarea id="m-pro" class="fill-textarea" maxlength="1000"></textarea>
+            <button onclick="saveMaster()" class="save-btn">저장</button>
+          </div>
+          <div class="list-side"><label>안내</label><p style="font-size:13px;color:#666;">프롬프트와 프롤로그가 모두 존재하면 모달 닫기 시 테마가 자동 분석됩니다.</p></div>
+        </div>
+        <div id="t-ex" class="tab-content">
+          <div class="editor-side">
+            <label>말투 학습(예시 대화 3쌍, 각 500자)</label>
+            <div class="ex-block"><label>Example 1</label><textarea id="ex-q-0" maxlength="500"></textarea><textarea id="ex-a-0" maxlength="500"></textarea></div>
+            <div class="ex-block"><label>Example 2</label><textarea id="ex-q-1" maxlength="500"></textarea><textarea id="ex-a-1" maxlength="500"></textarea></div>
+            <div class="ex-block"><label>Example 3</label><textarea id="ex-q-2" maxlength="500"></textarea><textarea id="ex-a-2" maxlength="500"></textarea></div>
+            <button onclick="saveExamples()" class="save-btn">저장</button>
+          </div>
+        </div>
+        <div id="t-lore" class="tab-content">
+          <div class="editor-side">
+            <label>키워드 이름 (최대 10자)</label>
+            <input type="text" id="kw-t" maxlength="10">
+            <label>트리거(최대 5개, Enter/Space)</label>
+            <div id="tag-container" onclick="focusTagInput()"><input type="text" id="tag-input" placeholder="입력 후 Enter/Space"></div>
+            <input type="hidden" id="tag-hidden" value="">
+            <input type="hidden" id="kw-index" value="-1">
+            <label>상세 설정 (최대 400자)</label>
+            <textarea id="kw-c" class="fill-textarea" maxlength="400"></textarea>
+            <button onclick="addLoreWithTags()" class="save-btn">저장/수정</button>
+          </div>
+          <div class="list-side">
+            <label>키워드 목록(위로 갈수록 우선)</label>
+            <div id="lore-list" style="flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:8px;"></div>
+          </div>
+        </div>
+      </div>
     </div>
-
+  </div>
 <script>
-    const socket = io();
-    let gState = null;
+  const socket = io();
+  let gState = null, myRole = null;
+  let lastSavedSys = "", lastSavedPro = "";
+  let tags = [], sortable = null;
 
-    socket.on('status_update', d => {
-        const statusEl = document.getElementById('status');
-        if(statusEl) {
-            statusEl.innerText = d.msg;
-            statusEl.style.color = d.msg.includes('❌') ? 'red' : 'var(--accent)';
-        }
+  function focusTagInput(){ document.getElementById('tag-input')?.focus(); }
+  function syncHidden(){ document.getElementById('tag-hidden').value = tags.join(','); }
+  function renderTags(){
+    const container = document.getElementById('tag-container');
+    const input = document.getElementById('tag-input');
+    if(!container || !input) return;
+    [...container.querySelectorAll('.tag-chip')].forEach(el=>el.remove());
+    tags.forEach((t, idx)=>{
+      const chip = document.createElement('span');
+      chip.className='tag-chip';
+      chip.innerHTML = `<span>${t}</span>`;
+      const x = document.createElement('button'); x.textContent='×';
+      x.onclick=(e)=>{e.stopPropagation(); tags.splice(idx,1); renderTags();};
+      chip.appendChild(x); container.insertBefore(chip, input);
     });
+    syncHidden();
+  }
+  function addTag(raw){
+    const t = (raw||"").trim(); if(!t) return;
+    if(t.length>20) return alert("트리거는 20자 이내로 입력해주세요.");
+    if(tags.length>=5) return alert("트리거는 최대 5개까지만 가능합니다.");
+    if(tags.includes(t)) return;
+    tags.push(t); renderTags();
+  }
+  function loadTagsFromString(s){
+    tags=[]; (s||"").split(',').map(x=>x.trim()).filter(Boolean).forEach(x=>{ if(!tags.includes(x)) tags.push(x); });
+    renderTags();
+  }
+  document.addEventListener('keydown', (e)=>{
+    const ti = document.getElementById('tag-input');
+    if(ti && document.activeElement===ti){
+      if(e.key==='Enter' || e.key===' ' || e.key===','){ e.preventDefault(); addTag(ti.value); ti.value=''; }
+      if(e.key==='Backspace' && ti.value==='' && tags.length>0){ tags.pop(); renderTags(); }
+    }
+  });
+  function clearLoreEditor(){
+    document.getElementById('kw-t').value=""; document.getElementById('kw-c').value="";
+    document.getElementById('kw-index').value="-1"; tags=[]; renderTags(); document.getElementById('tag-input').value="";
+  }
 
-    socket.on('initial_state', data => {
-        gState = data;
-        if (data.theme) {
-            const root = document.documentElement.style;
-            root.setProperty('--bg', data.theme.bg);
-            root.setProperty('--panel', data.theme.panel);
-            root.setProperty('--accent', data.theme.accent);
-        }
-        refreshUI();
+  socket.on('connect', ()=> socket.emit('join_game'));
+  socket.on('reload_signal', ()=> window.location.reload());
+  socket.on('assign_role', payload=>{
+    myRole = payload.role;
+    document.getElementById('user-role').value = myRole;
+    const roleEl = document.getElementById('role-display');
+    const msg = document.getElementById('msg-input');
+    const sendBtn = document.querySelector('#input-area button');
+    if(payload.mode === 'readonly'){
+      roleEl.innerText = "읽기 전용 모드(만석)";
+      msg.disabled = true; sendBtn.disabled = true;
+      msg.placeholder = "읽기 전용 모드입니다.";
+      return;
+    }
+    roleEl.innerText = (myRole==='user1') ? "Player 1 (당신)" : "Player 2 (당신)";
+  });
+  socket.on('status_update', d=>{
+    const s = document.getElementById('status');
+    s.innerText = d.msg; s.style.color = d.msg.includes('❌') ? 'red' : 'var(--accent)';
+  });
+  socket.on('admin_auth_res', d=>{
+    const ssb = document.getElementById('start-session-btn');
+    if(d.success){
+      document.getElementById('admin-modal').style.display='flex';
+      document.querySelectorAll('.tab-content').forEach(c=>c.classList.remove('active'));
+      document.querySelectorAll('.tab-btn').forEach(b=>b.classList.remove('active'));
+      document.getElementById('t-base').classList.add('active');
+      document.querySelector('.tab-btn').classList.add('active');
+      refreshUI();
+      if(ssb) ssb.style.display = 'block';
+      lastSavedSys = document.getElementById('m-sys').value || "";
+      lastSavedPro = document.getElementById('m-pro').value || "";
+    } else {
+      if(ssb) ssb.style.display = 'none';
+      alert("비밀번호가 일치하지 않습니다.");
+    }
+  });
+  socket.on('initial_state', data=>{
+    gState = data;
+    if(data.theme){
+      const root = document.documentElement.style;
+      root.setProperty('--bg', data.theme.bg); root.setProperty('--panel', data.theme.panel); root.setProperty('--accent', data.theme.accent);
+    }
+    refreshUI();
+  });
+
+  function requestAdmin(){
+    const pw = prompt("관리자 비밀번호를 입력하세요:");
+    if(pw) socket.emit('check_admin', {password: pw});
+  }
+  function closeModal(maybeAnalyze){
+    document.getElementById('admin-modal').style.display='none';
+    if(maybeAnalyze){
+      const sys = (document.getElementById('m-sys').value||"").trim();
+      const pro = (document.getElementById('m-pro').value||"").trim();
+      if(sys && pro) socket.emit('theme_analyze_request');
+    }
+  }
+  function openTab(evt,id){
+    document.querySelectorAll('.tab-content').forEach(c=>c.classList.remove('active'));
+    document.querySelectorAll('.tab-btn').forEach(b=>b.classList.remove('active'));
+    document.getElementById(id).classList.add('active'); evt.currentTarget.classList.add('active');
+  }
+  function refreshUI(){
+    if(!gState) return;
+    const msg = document.getElementById('msg-input');
+    const sendBtn = document.querySelector('#input-area button');
+    if(myRole==='readonly'){
+      msg.disabled=true; sendBtn.disabled=true;
+    } else {
+      if(gState.session_started){
+        msg.disabled=false; sendBtn.disabled=false; msg.placeholder="메시지를 입력하세요...";
+      } else {
+        msg.disabled=true; sendBtn.disabled=true; msg.placeholder="프로필 확정 후 마스터가 세션을 시작합니다.";
+      }
+    }
+    const cc = document.getElementById('chat-content');
+    let html = `<div style="text-align:center;padding:20px;color:var(--accent);font-weight:bold;font-size:1.4em;">${gState.session_title}</div>`;
+    html += `<div class="bubble center-ai"><div class="name-tag">PROLOGUE</div>${marked.parse(gState.prologue||"")}</div>`;
+    const myName = (myRole && gState.profiles && gState.profiles[myRole]) ? gState.profiles[myRole].name : null;
+    (gState.ai_history||[]).forEach(m=>{
+      const isAI = m.startsWith("**AI**:");
+      let who = "AI";
+      if(!isAI){ const mm = m.match(/^\*\*(.+?)\*\*:/); if(mm) who = mm[1]; }
+      const isMe = myName && who===myName && !isAI;
+      html += `<div class="bubble ${isMe?'user-bubble':'center-ai'}"><div class="name-tag">${who}</div>${marked.parse(m)}</div>`;
     });
-
-    function typeWriter(element, text, i = 0) {
-        if (i === 0) {
-            element.innerHTML = "";
-            element.style.whiteSpace = "pre-wrap";
-        }
-        if (i < text.length) {
-            element.textContent += text.charAt(i);
-            i++;
-            const win = document.getElementById('chat-window');
-            win.scrollTop = win.scrollHeight;
-            setTimeout(() => typeWriter(element, text, i), 10); 
-        } else {
-            element.innerHTML = marked.parse(text);
-            const win = document.getElementById('chat-window');
-            win.scrollTop = win.scrollHeight;
-        }
+    cc.innerHTML = html;
+    const p = (myRole && gState.profiles && gState.profiles[myRole]) ? gState.profiles[myRole] : {name:"",bio:"",canon:"",locked:false};
+    const activeId = document.activeElement?.id || "";
+    if(activeId!=='p-name') document.getElementById('p-name').value = p.name || "";
+    if(activeId!=='p-bio') document.getElementById('p-bio').value = p.bio || "";
+    if(activeId!=='p-canon') document.getElementById('p-canon').value = p.canon || "";
+    const locked = !!p.locked;
+    const disableProfile = (myRole==='readonly') || locked;
+    document.getElementById('p-name').readOnly = disableProfile;
+    document.getElementById('p-bio').readOnly = disableProfile;
+    document.getElementById('p-canon').readOnly = disableProfile;
+    const rb = document.getElementById('ready-btn');
+    rb.disabled = disableProfile;
+    rb.innerText = locked ? "설정이 확정되었습니다" : "설정 저장";
+    if(activeId!=='m-title') document.getElementById('m-title').value = gState.session_title || "";
+    if(activeId!=='m-sys') document.getElementById('m-sys').value = gState.sys_prompt || "";
+    if(activeId!=='m-pro') document.getElementById('m-pro').value = gState.prologue || "";
+    if(activeId!=='m-sum') document.getElementById('m-sum').value = gState.summary || "";
+    document.getElementById('m-ai-model').value = gState.ai_model || "gpt-4o";
+    document.getElementById('m-solo').value = gState.solo_mode ? "true" : "false";
+    if(gState.examples){
+      for(let i=0;i<3;i++){
+        const ex = gState.examples[i] || {};
+        if(activeId!==`ex-q-${i}`) document.getElementById(`ex-q-${i}`).value = ex.q || "";
+        if(activeId!==`ex-a-${i}`) document.getElementById(`ex-a-${i}`).value = ex.a || "";
+      }
     }
-
-    function refreshUI() {
-        if(!gState) return;
-        renderChat();
-        renderLore();
-        applyLockUI();
-        
-        const role = document.getElementById('user-role').value;
-        const p = gState.profiles[role];
-        const activeId = document.activeElement.id;
-
-        if(activeId !== 'p-name') document.getElementById('p-name').value = p.name || "";
-        if(activeId !== 'p-bio') document.getElementById('p-bio').value = p.bio || "";
-        if(activeId !== 'p-canon') document.getElementById('p-canon').value = p.canon || "";
-
-        if(activeId !== 'm-title') document.getElementById('m-title').value = gState.session_title || "";
-        if(activeId !== 'm-sys') document.getElementById('m-sys').value = gState.sys_prompt || "";
-        if(activeId !== 'm-pro') document.getElementById('m-pro').value = gState.prologue || "";
-        if(activeId !== 'm-sum') document.getElementById('m-sum').value = gState.summary || "";
+    renderLoreList();
+  }
+  function send(){
+    const t = document.getElementById('msg-input').value.trim();
+    if(!t) return;
+    socket.emit('client_message', {uid: myRole, text: t});
+    document.getElementById('msg-input').value='';
+  }
+  function saveProfile(){
+    const name = document.getElementById('p-name').value;
+    if(!name || name.includes("Player")) return alert("캐릭터 이름을 입력하세요.");
+    if(confirm("이 설정으로 확정하시겠습니까? (확정 후 수정 불가)")){
+      socket.emit('update_profile', {uid: myRole, name, bio: document.getElementById('p-bio').value, canon: document.getElementById('p-canon').value});
     }
-
-    function applyLockUI() {
-        if(!gState) return;
-        const role = document.getElementById('user-role').value;
-        const p = gState.profiles[role];
-        const isLocked = (p.name && p.name !== "Player 1" && p.name !== "Player 2" && gState.is_locked); // 조건 완화 혹은 강화 필요시 수정
-
-        // 개별 플레이어 설정 고정 로직
-        // 여기서는 간단히 이름이 설정되어 있고 저장 버튼 눌렀으면 잠금 처리 (간소화)
-    }
-
-    function renderChat() {
-        let h = `<div style="text-align:center; padding:20px; color:var(--accent); font-weight:bold; font-size:1.4em;">${gState.session_title}</div>`;
-        h += `<div class="bubble center-ai"><b>[PROLOGUE]</b><br>${marked.parse(gState.prologue || "")}</div>`;
-
-        const contentDiv = document.getElementById('chat-content');
-        const history = gState.ai_history;
-        const role = document.getElementById('user-role').value;
-        const pName = gState.profiles[role].name;
-
-        history.forEach((msg, index) => {
-            const isAI = msg.startsWith("**AI**:");
-            const isUser = pName && msg.includes(`**${pName}**:`);
-            const isLastMsg = (index === history.length - 1);
-            
-            if (isLastMsg && isAI) {
-                const bubbleId = `typing-${index}`;
-                h += `<div id="${bubbleId}" class="bubble center-ai"></div>`;
-                contentDiv.innerHTML = h;
-                const targetElement = document.getElementById(bubbleId);
-                // 이미 타이핑 중이면 스킵하는 로직이 필요할 수 있음
-                if(!targetElement.hasAttribute('data-typed')) {
-                    targetElement.setAttribute('data-typed', 'true');
-                    typeWriter(targetElement, msg); 
-                }
-            } else {
-                h += `<div class="bubble ${isUser ? 'user-bubble' : 'center-ai'}">${marked.parse(msg)}</div>`;
-            }
-        });
-
-        if (history.length === 0 || !history[history.length-1].startsWith("**AI**:")) {
-            contentDiv.innerHTML = h;
-        }
-        const win = document.getElementById('chat-window');
-        win.scrollTop = win.scrollHeight;
-    }
-
-    function send() {
-        const input = document.getElementById('msg-input');
-        const text = input.value.trim();
-        if(!text) return;
-        socket.emit('client_message', { uid: document.getElementById('user-role').value, text });
-        input.value = '';
-    }
-
-    function requestAdmin() {
-        const pw = prompt("관리자 비밀번호:");
-        if(pw) socket.emit('check_admin', { password: pw });
-    }
-
-    socket.on('admin_auth_res', d => {
-        if(d.success) {
-            document.getElementById('admin-modal').style.display = 'flex';
-            refreshUI();
-        } else {
-            alert("비밀번호 불일치");
-        }
+  }
+  function saveMaster(){
+    socket.emit('save_master_base', {
+      title: document.getElementById('m-title').value, sys: document.getElementById('m-sys').value,
+      pro: document.getElementById('m-pro').value, sum: document.getElementById('m-sum').value,
+      model: document.getElementById('m-ai-model').value, solo_mode: (document.getElementById('m-solo').value === "true")
     });
-
-    function saveMaster() {
-        const masterData = {
-            title: document.getElementById('m-title').value,
-            sys: document.getElementById('m-sys').value,
-            pro: document.getElementById('m-pro').value,
-            sum: document.getElementById('m-sum').value,
-            model: document.getElementById('m-ai-model').value
-        };
-        socket.emit('save_master_base', masterData);
-        alert("마스터 설정 저장 완료!");
-        closeModal();
-    }
-
-    function saveExamples() {
-        // 예시 데이터 처리 로직 간소화 (JSON 파싱 등은 필요시 추가)
-        const raw = document.getElementById('ex-data').value;
-        // 임시로 그냥 raw 텍스트로 보냄 (서버가 리스트 기대하면 수정 필요)
-        socket.emit('save_examples', []); 
-        alert("학습 데이터 저장 완료 (구현 필요)");
-    }
-
-    function addLore() {
-        const title = document.getElementById('kw-t').value;
-        if(!title) return alert("키워드명을 입력하세요.");
-        socket.emit('add_lore', {
-            title: title,
-            triggers: document.getElementById('kw-tr').value,
-            content: document.getElementById('kw-c').value,
-            priority: document.getElementById('kw-p').value
-        });
-        document.getElementById('kw-t').value = ""; 
-        document.getElementById('kw-tr').value = "";
-        document.getElementById('kw-c').value = "";
-    }
-
-    function editLore(idx) {
-        const l = gState.lorebook[idx];
-        document.getElementById('kw-t').value = l.title;
-        document.getElementById('kw-tr').value = l.triggers || "";
-        document.getElementById('kw-c').value = l.content;
-        document.getElementById('kw-p').value = l.priority || 0;
-        if(confirm("수정 모드: 기존 키워드를 삭제하고 입력창으로 불러옵니다.")) {
-            socket.emit('del_lore', { index: idx });
-        }
-    }
-
-    function renderLore() {
-        const listDiv = document.getElementById('lore-list');
-        if(!gState || !gState.lorebook) return;
-        listDiv.innerHTML = gState.lorebook.map((l, i) => `
-            <div style="padding:8px; background:rgba(0,0,0,0.03); margin-bottom:5px; border-radius:8px; display:flex; justify-content:space-between; align-items:center; border: 1px solid rgba(0,0,0,0.05);">
-                <span onclick="editLore(${i})" style="cursor:pointer; flex:1; font-size:13px;">
-                    <b>${l.title}</b> <small style="color:#666;">(P:${l.priority})</small>
-                </span>
-                <button onclick="socket.emit('del_lore', {index:${i}})" style="padding:2px 8px; font-size:11px; background:#ff4444; color:white !important;">삭제</button>
-            </div>`).join('');
-    }
-
-    function openTab(evt, id) {
-        document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
-        document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
-        document.getElementById(id).classList.add('active');
-        evt.currentTarget.classList.add('active');
-    }
-
-    function closeModal() { document.getElementById('admin-modal').style.display='none'; }
-
-    function saveProfile() {
-        const role = document.getElementById('user-role').value;
-        const name = document.getElementById('p-name').value;
-        if(!name || name.includes("Player")) return alert("이름을 입력하세요!");
-        
-        if(confirm("설정을 저장하시겠습니까?")) {
-            socket.emit('update_profile', {
-                uid: role,
-                name: name,
-                bio: document.getElementById('p-bio').value,
-                canon: document.getElementById('p-canon').value
-            });
-            alert("저장되었습니다.");
-        }
-    }
-
-    function sessionReset() { 
-        if(confirm("초기화하시겠습니까?")) { 
-            const pw = prompt("비밀번호:"); 
-            if(pw) socket.emit('reset_session', { password: pw }); 
-        } 
-    }
-
-    document.getElementById('msg-input').addEventListener('keydown', e => { 
-        if(e.key==='Enter' && !e.shiftKey) { e.preventDefault(); send(); } 
+    alert("설정이 저장되었습니다.");
+    lastSavedSys = document.getElementById('m-sys').value || "";
+    lastSavedPro = document.getElementById('m-pro').value || "";
+  }
+  function startSession(){ socket.emit('start_session'); }
+  function saveExamples(){
+    const exs = [];
+    for(let i=0;i<3;i++){ exs.push({ q: document.getElementById(`ex-q-${i}`).value, a: document.getElementById(`ex-a-${i}`).value }); }
+    socket.emit('save_examples', exs);
+    alert("학습 데이터가 저장되었습니다.");
+  }
+  function addLoreWithTags(){
+    const title = document.getElementById('kw-t').value;
+    const content = document.getElementById('kw-c').value;
+    const triggers = document.getElementById('tag-hidden').value;
+    const idx = parseInt(document.getElementById('kw-index').value);
+    if(!title) return alert("키워드 이름을 입력하세요.");
+    if(!triggers) return alert("트리거 태그를 추가하세요.");
+    if(!content) return alert("상세 설정을 입력하세요.");
+    socket.emit('add_lore', {title, triggers, content, index: idx});
+    clearLoreEditor();
+  }
+  function editLore(i){
+    const l = gState.lorebook[i];
+    document.getElementById('kw-t').value = l.title || "";
+    document.getElementById('kw-c').value = l.content || "";
+    document.getElementById('kw-index').value = i;
+    loadTagsFromString(l.triggers || "");
+  }
+  function delLore(i){ socket.emit('del_lore', {index:i}); }
+  function renderLoreList(){
+    const list = document.getElementById('lore-list');
+    if(!gState || !gState.lorebook) return;
+    list.innerHTML = gState.lorebook.map((l,i)=>`
+      <div class="lore-row" data-index="${i}">
+        <div class="drag-handle">☰</div>
+        <div class="lore-main">
+          <div class="lore-title">${l.title}</div>
+          <div class="lore-trg">${l.triggers}</div>
+        </div>
+        <div class="lore-actions">
+          <button class="mini-btn mini-edit" onclick="editLore(${i})">수정</button>
+          <button class="mini-btn mini-del" onclick="delLore(${i})">삭제</button>
+        </div>
+      </div>
+    `).join('');
+    if(sortable) sortable.destroy();
+    sortable = new Sortable(list, {
+      handle: '.drag-handle', animation: 120,
+      onEnd: (evt) => { if(evt.oldIndex !== evt.newIndex) socket.emit('reorder_lore', {from: evt.oldIndex, to: evt.newIndex}); }
     });
-    
-    socket.emit('request_data');
+  }
+  function uploadSessionFile(input){
+    if(!input.files || !input.files[0]) return;
+    const formData = new FormData(); formData.append('file', input.files[0]);
+    fetch('/import',{method:'POST',body:formData}).then(res=>{
+      if(res.ok) alert("설정이 복원되었습니다."); else alert("복원 실패"); input.value='';
+    }).catch(err=>alert("업로드 오류: "+err));
+  }
+  function sessionReset(){
+    if(confirm("정말로 초기화하시겠습니까?")){
+      const pw = prompt("관리자 비밀번호를 입력하세요:");
+      if(pw) socket.emit('reset_session', {password: pw});
+    }
+  }
 </script>
 </body>
 </html>
 """
 
-# --- SocketIO 핸들러 ---
-
-@app.route('/')
-def index():
-    current_theme = state.get('theme', {"bg": "#ffffff", "panel": "#f1f3f5", "accent": "#e91e63"})
-    return render_template_string(HTML_TEMPLATE, theme=current_theme)
-
-@socketio.on('request_data')
-def handle_request():
-    emit('initial_state', state)
-
-@socketio.on('lock_settings')
-def on_lock_settings():
-    p1 = state["profiles"].get("user1", {})
-    p2 = state["profiles"].get("user2", {})
-    if not p1.get("name") or not p2.get("name"):
-        emit('status_update', {'msg': '❌ 모든 플레이어 이름을 입력해야 합니다.'})
-        return
-    state["is_locked"] = True
-    save_data()
-    emit('initial_state', state, broadcast=True)
-    emit('status_update', {'msg': '🔒 설정 잠금 완료'})
-
-@socketio.on('client_message')
-def on_client_message(data):
-    user_text = data.get('text', '').strip()
-    uid = data.get('uid')
-    if not user_text: return
-
-    # 키워드(Lorebook) 매칭
-    sorted_lore = sorted(state.get('lorebook', []), key=lambda x: int(x.get('priority', 0)), reverse=True)
-    active_context = []
-    for lore in sorted_lore:
-        triggers = [t.strip() for t in lore.get('triggers', '').split(',') if t.strip()]
-        if any(trigger in user_text for trigger in triggers):
-            active_context.append(f"[{lore['title']}]: {lore['content']}")
-        if len(active_context) >= 3: break
-
-    lore_prompt = "\n".join(active_context)
-    
-    system_instruction = f"{state['sys_prompt']}\n\n[줄거리]: {state['summary']}\n[참고]: {lore_prompt}"
-    messages = [{"role": "system", "content": system_instruction}]
-
-    # 예시 추가
-    if state.get('examples'):
-        # examples 구조에 따라 유연하게 처리 필요 (현재는 빈 리스트일 수 있음)
-        pass 
-
-    # 히스토리 추가
-    for h in state['ai_history'][-15:]:
-        # 히스토리 포맷 파싱 (간단히 처리)
-        if h.startswith("**AI**:"):
-            messages.append({"role": "assistant", "content": h.replace("**AI**: ", "")})
-        else:
-            # 유저 이름 파싱 로직이 필요하지만 간단히
-            content = h.split(": ", 1)[-1] if ": " in h else h
-            messages.append({"role": "user", "content": content})
-
-    current_user_name = state['profiles'].get(uid, {}).get('name', '유저')
-    messages.append({"role": "user", "content": f"{current_user_name}: {user_text}"})
-
-    try:
-        response = client.chat.completions.create(model="gpt-4o", messages=messages, temperature=0.8)
-        ai_response = response.choices[0].message.content
-        
-        state["ai_history"].append(f"**{current_user_name}**: {user_text}")
-        state["ai_history"].append(f"**AI**: {ai_response}")
-        if len(state["ai_history"]) > 60: state["ai_history"] = state["ai_history"][-60:]
-        
-        save_data()
-        emit('initial_state', state, broadcast=True)
-        emit('status_update', {'msg': '✅ 응답 완료'})
-    except Exception as e:
-        emit('status_update', {'msg': f'❌ 에러: {str(e)}'})
-
-@socketio.on('add_lore')
-def on_add_lore(data):
-    new_entry = {
-        "title": data.get('title'),
-        "triggers": data.get('triggers'),
-        "content": data.get('content'),
-        "priority": int(data.get('priority', 0))
-    }
-    state.setdefault("lorebook", []).append(new_entry)
-    save_data()
-    emit('initial_state', state, broadcast=True)
-
-@socketio.on('del_lore')
-def on_del_lore(data):
-    idx = data.get('index')
-    if "lorebook" in state and 0 <= idx < len(state["lorebook"]):
-        state["lorebook"].pop(idx)
-        state["lorebook"].sort(key=lambda x: int(x.get('priority', 0)), reverse=True)
-        save_data()
-        emit('initial_state', state, broadcast=True)
-
-@socketio.on('save_master_base')
-def on_save_master(data):
-    state.update({
-        "session_title": data.get('title'),
-        "sys_prompt": data.get('sys'),
-        "prologue": data.get('pro'),
-        "summary": data.get('sum')
-    })
-    # 테마 자동 분석
-    state['theme'] = analyze_theme_color(state['session_title'], state['sys_prompt'])
-    save_data()
-    emit('initial_state', state, broadcast=True)
-
-@socketio.on('save_examples')
-def on_save_examples(data):
-    state["examples"] = data
-    save_data()
-    emit('initial_state', state, broadcast=True)
-
-@socketio.on('reset_session')
-def on_reset_session(data):
-    if str(data.get('password')) == str(state.get('admin_password')):
-        state.update({
-            "ai_history": [],
-            "lorebook": [],
-            "summary": "초기화됨",
-            "is_locked": False,
-            "session_title": "새로운 세션"
-        })
-        save_data()
-        emit('initial_state', state, broadcast=True)
-
-@socketio.on('update_profile')
-def on_profile(data):
-    uid = data.get('uid')
-    if uid in state["profiles"]:
-        state["profiles"][uid].update({
-            "name": data.get('name'),
-            "bio": data.get('bio'),
-            "canon": data.get('canon')
-        })
-        save_data()
-        emit('initial_state', state, broadcast=True)
-
-@socketio.on('check_admin')
-def check_admin(data):
-    success = str(data.get('password')) == str(state.get('admin_password'))
-    emit('admin_auth_res', {'success': success})
-
-if __name__ == '__main__':
-    try:
-        ngrok.kill()
-        public_url = ngrok.connect(5000).public_url
-        print("\n" + "="*50)
-        print(f"🚀 드림 시뮬레이터 서버 실행 중!")
-        print(f"🔗 접속 주소: {public_url}")
-        print("="*50 + "\n")
-        socketio.run(app, port=5000, allow_unsafe_werkzeug=True)
-    except Exception as e:
-        print(f"❌ 오류 발생: {e}")
+if __name__ == "__main__":
+    if IS_COLAB:
+        # Colab에서는 Ngrok으로 외부 접속
+        try:
+            import subprocess
+            subprocess.run(["pkill", "-9", "ngrok"])
+            ngrok.kill()
+            public_url = ngrok.connect(5000).public_url
+            print("\n" + "="*60)
+            print("🚀 서버가 시작되었습니다.")
+            print(f"🔗 접속 주소: {public_url}")
+            print(f"🔐 관리자 비밀번호: {state.get('admin_password')}")
+            print("="*60 + "\n")
+            socketio.run(app, host="0.0.0.0", port=5000, allow_unsafe_werkzeug=True)
+        except Exception as e:
+            print(f"❌ 실행 오류: {e}")
+    else:
+        # 로컬 실행
+        print("\n🚀 로컬 서버 시작: http://localhost:5000")
+        socketio.run(app, host="0.0.0.0", port=5000)
