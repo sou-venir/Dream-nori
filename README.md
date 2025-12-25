@@ -40,10 +40,11 @@ pip install -r requirements.txt
 프로젝트 폴더에 `.env` 파일을 만들고 아래 형식으로 작성해 저장합니다. (`.txt`가 붙지 않게 주의)
 
 ```                            
-OPENAI_API_KEY=발급받으신_OPENAI_API키
-GEMINI_API_KEY=발급받으신_GEMINI_API키
-NGROK_AUTH_TOKEN=발급받으신_NGROK_토큰
-PASSWORD=원하시는_비밀번호
+OPENAI_API_KEY="발급받으신 openai 키"
+GEMINI_API_KEY="발급받으신 제미나이 키"
+GEMINI_API_KEY="발급받으신 제미나이 키"
+ADMIN_PASSWORD="원하시는 비밀번호"
+DATA_DIR="./data"
 ```
                         
 
@@ -59,6 +60,6 @@ python app.py
 ## 🔰 설치가 어려우신 경우(코랩 실행)
 1) 코랩 열기:  
 https://colab.research.google.com/github/sou-venir/Dream-nori/blob/main/%EC%BD%94%EB%9E%A9%EC%9D%84%EC%9C%84%ED%95%9C%EB%93%9C%EB%A6%BC%EB%86%80%EC%9D%B4.ipynb  
-2) 왼쪽 **열쇠(🔑)**에서 `OPENAI_API_KEY`, `NGROK_AUTH_TOKEN`, 'GEMINI_API_KEY', 'PASSWORD' 를 동일한 이름으로 저장하고, **노트북 액세스**를 ON으로 변경합니다.  
+2) 왼쪽 **열쇠(🔑)**에서 `OPENAI_API_KEY`, `NGROK_AUTH_TOKEN`, 'GEMINI_API_KEY', 'ADMIN_PASSWORD' 를 동일한 이름으로 저장하고, **노트북 액세스**를 ON으로 변경합니다.  
 3) **런타임 → 모두 실행**을 누릅니다.  
 4) 하단에 출력되는 접속 주소로 들어가시면 됩니다.
