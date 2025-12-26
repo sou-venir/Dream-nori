@@ -6,63 +6,58 @@ import openai
 import google.generativeai as genai
 
 # =========================
-# Env
+# 1. 환경 변수 설정 (로컬/배포용)
 # =========================
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "5000"))
+
+# 데이터 저장 경로 (구글 드라이브 X -> 로컬 폴더 O)
 DATA_DIR = os.getenv("DATA_DIR", "./data")
 os.makedirs(DATA_DIR, exist_ok=True)
 DATA_FILE = os.path.join(DATA_DIR, "save_data.json")
 
-ADMIN_PASSWORD_ENV = os.getenv("ADMIN_PASSWORD", "").strip()
+# 관리자 비밀번호 (환경변수 없으면 기본값 3896)
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")
 
+# API 키 설정
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-if not OPENAI_API_KEY:
-    raise RuntimeError("OPENAI_API_KEY is required.")
-
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
+# 키 확인 (OpenAI는 필수)
+if not OPENAI_API_KEY:
+    print("⚠️ 경고: OPENAI_API_KEY가 환경변수에 설정되지 않았습니다.")
+
 # =========================
-# AI clients
+# 2. AI 클라이언트 초기화
 # =========================
-client = openai.OpenAI(api_key=OPENAI_API_KEY)
+client = None
+if OPENAI_API_KEY:
+    client = openai.OpenAI(api_key=OPENAI_API_KEY)
 
 gemini_model = None
 if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
-    gemini_model = genai.GenerativeModel('gemini-3-pro-preview')
+    try:
+        genai.configure(api_key=GEMINI_API_KEY)
+        gemini_model = genai.GenerativeModel('gemini-3-pro-preview') # 혹은 gemini-1.5-pro-latest
+    except Exception as e:
+        print(f"⚠️ Gemini 설정 오류: {e}")
 
 # =========================
-# Flask / Socket
+# 3. 앱 설정
 # =========================
 app = Flask(__name__)
-app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
+# 용량 제한 16MB
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024 
 socketio = SocketIO(app, cors_allowed_origins="*")
 
 # =========================
-# Storage
-# =========================
-def save_data():
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, indent=2)
-
-def load_data():
-    if os.path.exists(DATA_FILE):
-        try:
-            with open(DATA_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except:
-            return None
-    return None
-
-# =========================
-# State
+# 4. 데이터 저장/로드
 # =========================
 initial_state = {
     "session_title": "드림놀이",
     "theme": {"bg": "#ffffff", "panel": "#f1f3f5", "accent": "#e91e63"},
     "ai_model": "gpt-5.2",
-    "admin_password": "3896",
+    "admin_password": ADMIN_PASSWORD_ENV,
 
     "solo_mode": False,
     "session_started": False,
@@ -73,37 +68,47 @@ initial_state = {
     },
 
     "pending_inputs": {},
-
     "ai_history": [],
     "summary": "",
     "prologue": "",
     "sys_prompt": "당신은 숙련된 TRPG 마스터입니다.",
-
     "lorebook": [],
     "examples": [{"q": "", "a": ""}, {"q": "", "a": ""}, {"q": "", "a": ""}]
 }
 
-saved_state = load_data()
-state = saved_state if isinstance(saved_state, dict) else copy.deepcopy(initial_state)
+state = copy.deepcopy(initial_state)
 
-if ADMIN_PASSWORD_ENV:
-    state["admin_password"] = ADMIN_PASSWORD_ENV
+def save_data():
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
 
-# 접속/관리자
+def load_data():
+    if os.path.exists(DATA_FILE):
+        try:
+            with open(DATA_FILE, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+                state.update(loaded)
+                # 환경변수 비번이 우선
+                if ADMIN_PASSWORD_ENV:
+                    state["admin_password"] = ADMIN_PASSWORD_ENV
+        except:
+            pass
+
+# 시작 시 데이터 로드
+load_data()
+
+# 접속자 관리
 connected_users = {"user1": None, "user2": None}
 readonly_sids = set()
 admin_sids = set()
-
-# 입력중 표시
 typing_users = set()
 
 # =========================
-# Helpers
+# 5. 헬퍼 함수
 # =========================
 def sanitize_filename(name: str) -> str:
     name = (name or "session").strip()
     name = re.sub(r'[\\/:*?"<>|]+', "_", name)
-    name = re.sub(r"\s+", "_", name)
     return name[:60] or "session"
 
 def get_export_config_only():
@@ -112,7 +117,7 @@ def get_export_config_only():
         "sys_prompt": state.get("sys_prompt", ""),
         "prologue": state.get("prologue", ""),
         "ai_model": state.get("ai_model", "gpt-5.2"),
-        "examples": state.get("examples", [{"q":"","a":""},{"q":"","a":""},{"q":"","a":""}]),
+        "examples": state.get("examples", []),
         "lorebook": state.get("lorebook", []),
         "solo_mode": bool(state.get("solo_mode", False)),
         "_export_type": "dream_config_only_v1"
@@ -126,6 +131,7 @@ def import_config_only(data: dict):
 
 def get_sanitized_state():
     safe = copy.deepcopy(state)
+    # 민감 정보 가림
     safe["profiles"]["user1"]["bio"] = ""
     safe["profiles"]["user1"]["canon"] = ""
     safe["profiles"]["user2"]["bio"] = ""
@@ -144,27 +150,22 @@ def emit_state_to_players():
         socketio.emit("initial_state", payload, room=connected_users["user2"])
 
 def analyze_theme_color(title, sys_prompt):
+    if not client: return state.get("theme")
     try:
         res = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role":"system","content":"웹 UI 컬러 팔레트 전문가입니다. 반드시 JSON으로만 답변하세요: {\"bg\":\"#RRGGBB\",\"panel\":\"#RRGGBB\",\"accent\":\"#RRGGBB\"}"},
-                {"role":"user","content":f"세션 제목: {title}\n시스템 프롬프트 요약: {sys_prompt[:800]}"}
+                {"role":"system","content":"Output JSON only: {\"bg\":\"#Hex\",\"panel\":\"#Hex\",\"accent\":\"#Hex\"}"},
+                {"role":"user","content":f"Title: {title}\nPrompt: {sys_prompt[:800]}"}
             ],
             response_format={"type":"json_object"}
         )
         obj = json.loads(res.choices[0].message.content)
-        out = state.get("theme", {"bg":"#ffffff","panel":"#f1f3f5","accent":"#e91e63"})
-        for k in ("bg","panel","accent"):
-            if isinstance(obj.get(k), str) and obj[k].startswith("#"):
-                out[k] = obj[k]
-        return out
+        return obj
     except:
-        return state.get("theme", {"bg":"#ffffff","panel":"#f1f3f5","accent":"#e91e63"})
+        return state.get("theme")
 
-# -------------------------
-# Context / Summary
-# -------------------------
+# Context Logic
 MAX_CONTEXT_CHARS_BUDGET = 14000
 HISTORY_SOFT_LIMIT_CHARS = 9500
 SUMMARY_MAX_CHARS = 500
@@ -172,7 +173,8 @@ TARGET_MAX_TOKENS = 1100
 
 def build_history_block():
     history = state.get("ai_history", [])
-    collected, total = [], 0
+    collected = []
+    total = 0
     for msg in reversed(history):
         add_len = len(msg) + 1
         if total + add_len > HISTORY_SOFT_LIMIT_CHARS:
@@ -191,29 +193,22 @@ def would_overflow_context(extra_incoming: str) -> bool:
     return rough > MAX_CONTEXT_CHARS_BUDGET
 
 def auto_summary_apply():
+    if not client: return
     def run_once():
         recent_log = "\n".join(state.get("ai_history", [])[-60:])
-        if not recent_log:
-            return None
-        prompt = (
-            "당신은 TRPG 진행 보조 AI입니다.\n"
-            "아래 최근 대화를 바탕으로 '현재 상황 요약'을 2~3문장으로 작성해 주세요.\n"
-            "사실/행동/목표 중심으로 간결하게 작성해 주세요.\n\n"
-            f"[최근 대화]\n{recent_log}"
-        )
-        res = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role":"user","content":prompt}]
-        )
-        return (res.choices[0].message.content or "").strip()
+        if not recent_log: return None
+        try:
+            res = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role":"user","content":f"Summarize in 3 sentences:\n{recent_log}"}]
+            )
+            return (res.choices[0].message.content or "").strip()
+        except: return None
 
-    try:
-        s = run_once() or run_once()
-        if s:
-            state["summary"] = s[:SUMMARY_MAX_CHARS]
-            save_data()
-    except:
-        pass
+    s = run_once()
+    if s:
+        state["summary"] = s[:SUMMARY_MAX_CHARS]
+        save_data()
 
 # =========================
 # Routes
@@ -236,16 +231,8 @@ def export_config():
 @app.route("/import", methods=["POST"])
 def import_config():
     try:
-        if "file" not in request.files:
-            return "파일이 없습니다.", 400
         file = request.files["file"]
-        if file.filename == "":
-            return "선택된 파일이 없습니다.", 400
-        data = json.load(file)
-        if not isinstance(data, dict):
-            return "올바른 JSON이 아닙니다.", 400
-
-        import_config_only(data)
+        import_config_only(json.load(file))
         save_data()
         emit_state_to_players()
         socketio.emit("reload_signal")
@@ -254,401 +241,255 @@ def import_config():
         return str(e), 500
 
 # =========================
-# Socket: join / disconnect
+# Sockets
 # =========================
 @socketio.on("join_game")
 def join_game(data=None):
     sid = request.sid
     saved_role = data.get("saved_role") if data else None
 
-    # 1. 새로고침한 유저가 기존 역할을 가지고 있는 경우 재연결
+    # 재접속
     if saved_role in connected_users and connected_users[saved_role] is None:
         connected_users[saved_role] = sid
         emit("assign_role", {"role": saved_role, "mode": "player"})
         emit_state_to_players()
         return
 
-    # 2. 기존 로직 (신규 접속)
+    # 신규
     for role, rsid in connected_users.items():
         if rsid == sid:
-            emit("assign_role", {"role": role, "mode": "player"})
-            emit_state_to_players()
-            return
+            emit("assign_role", {"role": role, "mode": "player"}); emit_state_to_players(); return
 
     if connected_users["user1"] is None:
         connected_users["user1"] = sid
         emit("assign_role", {"role": "user1", "mode": "player"})
-        emit_state_to_players()
-        return
-
-    if connected_users["user2"] is None:
+    elif connected_users["user2"] is None:
         connected_users["user2"] = sid
         emit("assign_role", {"role": "user2", "mode": "player"})
-        emit_state_to_players()
-        return
-
-    # 그 외는 읽기 전용
-    readonly_sids.add(sid)
-    emit("assign_role", {"role": "readonly", "mode": "readonly"})
-    emit("initial_state", get_sanitized_state())
+    else:
+        readonly_sids.add(sid)
+        emit("assign_role", {"role": "readonly", "mode": "readonly"})
     
+    emit_state_to_players()
+
 @socketio.on("disconnect")
 def on_disconnect():
     sid = request.sid
     admin_sids.discard(sid)
-
     for role in ("user1","user2"):
         if connected_users[role] == sid:
             connected_users[role] = None
             typing_users.discard(role)
-            state.get("pending_inputs", {}).pop(role, None)
-
+            state.get("pending_inputs", {}).pop(role, None) # 나간 사람 입력 취소
     readonly_sids.discard(sid)
     save_data()
     emit_state_to_players()
 
-# =========================
-# Socket: typing indicator
-# =========================
 @socketio.on("start_typing")
 def start_typing(data):
     uid = data.get("uid")
-    if uid in ("user1","user2") and connected_users.get(uid) == request.sid:
+    if uid in connected_users and connected_users[uid] == request.sid:
         typing_users.add(uid)
         emit_state_to_players()
 
 @socketio.on("stop_typing")
 def stop_typing(data):
     uid = data.get("uid")
-    if uid in ("user1","user2"):
+    if uid in typing_users:
         typing_users.discard(uid)
         emit_state_to_players()
 
-# =========================
-# Socket: admin / save
-# =========================
 @socketio.on("check_admin")
 def check_admin(data):
-    ok = str(data.get("password")) == str(state.get("admin_password"))
-    if ok:
+    if str(data.get("password")) == str(state.get("admin_password")):
         admin_sids.add(request.sid)
-    emit("admin_auth_res", {"success": ok})
+        emit("admin_auth_res", {"success": True})
+    else:
+        emit("admin_auth_res", {"success": False})
 
 @socketio.on("save_master_base")
 def save_master_base(data):
-    state["session_title"] = (data.get("title", state["session_title"]) or "")[:30]
-    state["sys_prompt"] = (data.get("sys", state["sys_prompt"]) or "")[:4000]
-    state["prologue"] = (data.get("pro", state["prologue"]) or "")[:1000]
-    state["summary"] = (data.get("sum", state["summary"]) or "")[:SUMMARY_MAX_CHARS]
-    state["ai_model"] = data.get("model", state.get("ai_model","gpt-5.2"))
-    state["solo_mode"] = bool(data.get("solo_mode", state.get("solo_mode", False)))
-
+    if request.sid not in admin_sids: return
+    state["session_title"] = data.get("title")
+    state["sys_prompt"] = data.get("sys")
+    state["prologue"] = data.get("pro")
+    state["summary"] = data.get("sum")
+    state["ai_model"] = data.get("model")
+    state["solo_mode"] = data.get("solo_mode")
     save_data()
     emit_state_to_players()
 
 @socketio.on("theme_analyze_request")
 def theme_analyze_request(_=None):
-    if not (state.get("sys_prompt","").strip() and state.get("prologue","").strip()):
-        return
-    state["theme"] = analyze_theme_color(state.get("session_title",""), state.get("sys_prompt",""))
-    save_data()
-    emit_state_to_players()
-    socketio.emit("reload_signal")
+    if state["sys_prompt"]:
+        state["theme"] = analyze_theme_color(state["session_title"], state["sys_prompt"])
+        save_data(); emit_state_to_players(); socketio.emit("reload_signal")
 
 @socketio.on("save_examples")
 def save_examples(data):
-    out = []
-    for i in range(3):
-        ex = data[i] if i < len(data) else {"q":"","a":""}
-        out.append({"q": (ex.get("q","") or "")[:500], "a": (ex.get("a","") or "")[:500]})
-    state["examples"] = out
-    save_data()
-    emit_state_to_players()
+    if request.sid not in admin_sids: return
+    state["examples"] = [{"q":d["q"],"a":d["a"]} for d in data]
+    save_data(); emit_state_to_players()
 
 @socketio.on("update_profile")
 def update_profile(data):
     uid = data.get("uid")
-    if uid not in ("user1","user2"):
-        return
-    if connected_users.get(uid) != request.sid:
-        return
-    if state["profiles"][uid].get("locked"):
-        return
-
-    name = (data.get("name") or "").strip()
-    if not name:
-        return
-
-    state["profiles"][uid]["name"] = name[:12]
-    state["profiles"][uid]["bio"] = (data.get("bio") or "")[:200]
-    state["profiles"][uid]["canon"] = (data.get("canon") or "")[:350]
-    state["profiles"][uid]["locked"] = True
-
-    save_data()
-    emit_state_to_players()
+    if uid in state["profiles"]:
+        state["profiles"][uid].update({
+            "name": data.get("name")[:12],
+            "bio": data.get("bio")[:200],
+            "canon": data.get("canon")[:350],
+            "locked": True
+        })
+        save_data(); emit_state_to_players()
 
 @socketio.on("start_session")
 def start_session(_=None):
-    if request.sid not in admin_sids:
-        emit("status_update", {"msg": "⚠️ 세션 시작은 마스터만 가능합니다."})
-        return
-
-    if state.get("session_started"):
-        emit("status_update", {"msg": "ℹ️ 세션은 이미 시작된 상태입니다."})
-        return
-
-    if state.get("solo_mode"):
-        if not state["profiles"]["user1"].get("locked"):
-            emit("status_update", {"msg": "⚠️ 1인 모드에서는 Player 1의 프로필 저장(확정)이 필요합니다."})
-            return
+    if request.sid in admin_sids:
         state["session_started"] = True
-        save_data()
-        emit_state_to_players()
-        emit("status_update", {"msg": "✅ 1인 모드로 세션이 시작되었습니다."}, broadcast=True)
-        return
+        save_data(); emit_state_to_players()
+        emit("status_update", {"msg": "✅ 세션이 시작되었습니다!"}, broadcast=True)
 
-    p1_locked = bool(state["profiles"]["user1"].get("locked"))
-    p2_locked = bool(state["profiles"]["user2"].get("locked"))
-
-    if not p1_locked and not p2_locked:
-        emit("status_update", {"msg": "⚠️ Player 1과 Player 2 모두 프로필 저장(확정)이 필요합니다."})
-        return
-    if not p1_locked:
-        emit("status_update", {"msg": "⚠️ Player 1의 프로필 저장(확정)이 필요합니다."})
-        return
-    if not p2_locked:
-        emit("status_update", {"msg": "⚠️ Player 2의 프로필 저장(확정)이 필요합니다."})
-        return
-
-    state["session_started"] = True
-    save_data()
-    emit_state_to_players()
-    emit("status_update", {"msg": "✅ 2인 모드로 세션이 시작되었습니다."}, broadcast=True)
-
-# =========================
-# Socket: lorebook
-# =========================
 @socketio.on("add_lore")
 def add_lore(data):
+    item = {"title": data.get("title"), "triggers": data.get("triggers"), "content": data.get("content")}
     idx = int(data.get("index", -1))
-    title = (data.get("title","") or "")[:10]
-    triggers = (data.get("triggers","") or "")
-    content = (data.get("content","") or "")[:400]
-    item = {"title": title, "triggers": triggers, "content": content}
-
-    state.setdefault("lorebook", [])
-    if 0 <= idx < len(state["lorebook"]):
-        state["lorebook"][idx] = item
-    else:
-        state["lorebook"].append(item)
-
-    save_data()
-    emit_state_to_players()
+    if 0 <= idx < len(state["lorebook"]): state["lorebook"][idx] = item
+    else: state["lorebook"].append(item)
+    save_data(); emit_state_to_players()
 
 @socketio.on("del_lore")
 def del_lore(data):
-    try:
-        state["lorebook"].pop(int(data.get("index")))
-        save_data()
-        emit_state_to_players()
-    except:
-        pass
+    try: state["lorebook"].pop(int(data.get("index"))); save_data(); emit_state_to_players()
+    except: pass
 
 @socketio.on("reorder_lore")
 def reorder_lore(data):
     try:
-        f = int(data.get("from"))
-        t = int(data.get("to"))
-        lb = state.get("lorebook", [])
-        if 0 <= f < len(lb) and 0 <= t < len(lb):
-            item = lb.pop(f)
-            lb.insert(t, item)
-            save_data()
-            emit_state_to_players()
-    except:
-        pass
+        f, t = int(data.get("from")), int(data.get("to"))
+        state["lorebook"].insert(t, state["lorebook"].pop(f))
+        save_data(); emit_state_to_players()
+    except: pass
 
-# =========================
-# Socket: reset
-# =========================
 @socketio.on("reset_session")
 def reset_session(data):
-    if str(data.get("password")) != str(state.get("admin_password")):
-        emit("status_update", {"msg": "❌ 비밀번호가 일치하지 않습니다."})
-        return
-
-    state["ai_history"] = []
-    state["lorebook"] = []
-    state["summary"] = ""
-    state["pending_inputs"] = {}
-    typing_users.clear()
-
-    state["session_started"] = False
-    state["profiles"]["user1"]["locked"] = False
-    state["profiles"]["user2"]["locked"] = False
-    save_data()
-    emit_state_to_players()
+    if str(data.get("password")) == str(state.get("admin_password")):
+        state["ai_history"] = []
+        state["lorebook"] = []
+        state["summary"] = ""
+        state["pending_inputs"] = {}
+        typing_users.clear()
+        state["session_started"] = False
+        state["profiles"]["user1"]["locked"] = False
+        state["profiles"]["user2"]["locked"] = False
+        save_data(); emit_state_to_players()
 
 # =========================
-# ✅ 합작: pending_inputs + 스킵 + 1회 출력
+# Chat & AI Logic
 # =========================
-def record_pending(uid: str, text: str):
-    state.setdefault("pending_inputs", {})
-    state["pending_inputs"][uid] = {
-        "text": (text or "")[:600],
-        "ts": datetime.now().isoformat(timespec="seconds")
-    }
+def record_pending(uid, text):
+    state["pending_inputs"][uid] = {"text": text[:600], "ts": datetime.now().isoformat()}
     save_data()
 
-def both_ready() -> bool:
-    if state.get("solo_mode"):
-        return "user1" in state.get("pending_inputs", {})
-    return ("user1" in state.get("pending_inputs", {})) and ("user2" in state.get("pending_inputs", {}))
+def both_ready():
+    if state.get("solo_mode"): return "user1" in state["pending_inputs"]
+    return ("user1" in state["pending_inputs"]) and ("user2" in state["pending_inputs"])
 
 @socketio.on("client_message")
 def client_message(data):
     uid = data.get("uid")
-    text = (data.get("text") or "").strip()
-
-    if uid not in ("user1","user2"):
-        return
-    if connected_users.get(uid) != request.sid:
-        return
-    if not state.get("session_started", False):
-        emit("status_update", {"msg": "⚠️ 세션이 아직 시작되지 않았습니다."})
-        return
-
-    record_pending(uid, text)
+    if uid not in ("user1","user2") or not state.get("session_started"): return
+    
+    record_pending(uid, data.get("text","").strip())
     typing_users.discard(uid)
     emit_state_to_players()
 
-    if both_ready():
-        try:
-            trigger_ai_from_pending()
-        except Exception as e:
-            socketio.emit("status_update", {"msg": f"❌ 오류: {str(e)}"})
+    if both_ready(): trigger_ai()
     else:
         other = "user2" if uid == "user1" else "user1"
-        other_name = state["profiles"][other].get("name", other)
-        socketio.emit("status_update", {"msg": f"⏳ {other_name} 입력을 기다리는 중... (스킵 가능)"})
+        nm = state["profiles"][other]["name"]
+        emit("status_update", {"msg": f"⏳ {nm}님 입력 대기 중..."}, broadcast=True)
 
 @socketio.on("skip_turn")
 def skip_turn(data):
     uid = data.get("uid")
-    if uid not in ("user1","user2"):
-        return
-    if connected_users.get(uid) != request.sid:
-        return
-    if not state.get("session_started", False):
-        return
-
+    if uid not in ("user1","user2") or not state.get("session_started"): return
+    
     record_pending(uid, "(스킵)")
     typing_users.discard(uid)
     emit_state_to_players()
 
-    if both_ready():
-        try:
-            trigger_ai_from_pending()
-        except Exception as e:
-            socketio.emit("status_update", {"msg": f"❌ 오류: {str(e)}"})
+    if both_ready(): trigger_ai()
     else:
         other = "user2" if uid == "user1" else "user1"
-        other_name = state["profiles"][other].get("name", other)
-        socketio.emit("status_update", {"msg": f"⏳ {other_name} 입력을 기다리는 중... (스킵 가능)"})
+        nm = state["profiles"][other]["name"]
+        emit("status_update", {"msg": f"⏳ {nm}님 입력 대기 중..."}, broadcast=True)
 
-def trigger_ai_from_pending():
-    pending = state.get("pending_inputs", {})
-    p1_text = pending.get("user1", {}).get("text", "(스킵)")
-    p2_text = pending.get("user2", {}).get("text", "(스킵)")
+def trigger_ai():
+    try:
+        pending = state.get("pending_inputs", {})
+        p1t = pending.get("user1", {}).get("text", "(스킵)")
+        p2t = pending.get("user2", {}).get("text", "(스킵)")
+        p1n = state["profiles"]["user1"]["name"]
+        p2n = state["profiles"]["user2"]["name"]
 
-    p1_name = state["profiles"]["user1"].get("name","Player 1")
-    p2_name = state["profiles"]["user2"].get("name","Player 2")
-
-    merged = f"{p1_text}\n{p2_text}"
-
-    # 키워드 상위 3개
-    active_context = []
-    for l in state.get("lorebook", []):
-        triggers = [t.strip() for t in (l.get("triggers","")).split(",") if t.strip()]
-        if any(t in merged for t in triggers):
-            active_context.append(f"[{l.get('title','')}]: {l.get('content','')}")
-    active_context = active_context[:3]
-
-    system_content = (
-        f"{state.get('sys_prompt','')}\n\n"
-        f"[현재 상황 요약]\n{state.get('summary','')}\n\n"
-        f"[키워드 참고]\n" + "\n".join(active_context)
-    )
-
-    if would_overflow_context(system_content + merged):
-        auto_summary_apply()
-        system_content = (
-            f"{state.get('sys_prompt','')}\n\n"
-            f"[현재 상황 요약]\n{state.get('summary','')}\n\n"
-            f"[키워드 참고]\n" + "\n".join(active_context)
-        )
-
-    round_block = (
-        f"--- [ROUND INPUT] ---\n"
-        f"<{p1_name}>: {p1_text}\n"
-        f"<{p2_name}>: {p2_text}\n"
-        f"--- [INSTRUCTION] ---\n"
-        f"두 행동은 동시간대에 발생했다. 입력 순서와 무관하게 논리적으로 결합해 다음 장면을 서술하라.\n"
-        f"분량은 공백 포함 2000자 내외로 풍성하게."
-    )
-
-    messages = [{"role":"system","content":system_content}]
-
-    for ex in state.get("examples", []):
-        if ex.get("q") and ex.get("a"):
-            messages.append({"role":"user","content":ex["q"]})
-            messages.append({"role":"assistant","content":ex["a"]})
-
-    for h in build_history_block():
-        messages.append({"role": "assistant" if h.startswith("**AI**") else "user", "content": h})
-
-    messages.append({"role":"user","content": round_block})
-
-    current_model = state.get("ai_model","gpt-5.2")
-    socketio.emit("status_update", {"msg": f"🤔 {current_model} (합작) 응답 생성 중..."})
-
-    if "gemini" in current_model.lower():
-        if gemini_model is None:
-            raise Exception("Gemini API 키가 없습니다.")
+        merged = f"{p1t}\n{p2t}"
         
-        # 안전 설정 정의 (성인용/폭력 묘사 허용 범위 최대화)
-        from google.generativeai.types import HarmCategory, HarmBlockThreshold
-        safety_settings = {
-            # 성적인 내용은 차단 안 함
-            HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
-            # 괴롭힘, 증오 발언, 위험 요소는 아주 심각한 것(HIGH)만 차단
-            HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
-            HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
-            HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
-        }
-
-        prompt = system_content + "\n" + "\n".join(build_history_block()) + "\n" + round_block + "\nAI:"
+        # Lorebook
+        active = []
+        for l in state.get("lorebook", []):
+            if any(t.strip() in merged for t in l["triggers"].split(",")):
+                active.append(f"[{l['title']}]: {l['content']}")
         
-        try:
-            # 설정 적용하여 호출
-            res = genai.GenerativeModel(current_model).generate_content(
-                prompt, 
-                safety_settings=safety_settings
-            )
-            ai_response = res.text
-        except Exception as e:
-            ai_response = f"⚠️ AI 응답 생성 중 오류가 발생했습니다. (필터링 또는 연결 오류: {str(e)})"
+        sys = f"{state['sys_prompt']}\n\n[Summary]\n{state['summary']}\n\n[Lore]\n" + "\n".join(active[:3])
+        
+        if would_overflow_context(sys + merged):
+            auto_summary_apply()
+            sys = f"{state['sys_prompt']}\n\n[Summary]\n{state['summary']}\n\n[Lore]\n" + "\n".join(active[:3])
 
-    state["ai_history"].append(f"**Round**: {p1_name}: {p1_text} / {p2_name}: {p2_text}")
-    state["ai_history"].append(f"**AI**: {ai_response}")
-    state["pending_inputs"] = {}
-    save_data()
+        round_block = f"--- [ROUND INPUT] ---\n<{p1n}>: {p1t}\n<{p2n}>: {p2t}\n--- [INSTRUCTION] ---\n두 행동은 동시간대입니다. 통합하여 2000자 내외로 서술하세요."
 
-    socketio.emit("ai_typewriter_event", {"content": ai_response})
-    emit_state_to_players()
+        msgs = [{"role":"system", "content": sys}]
+        for ex in state.get("examples", []):
+            if ex["q"]: msgs.extend([{"role":"user","content":ex["q"]}, {"role":"assistant","content":ex["a"]}])
+        
+        for h in build_history_block():
+            msgs.append({"role": "assistant" if h.startswith("**AI**") else "user", "content": h})
+        
+        msgs.append({"role":"user", "content": round_block})
+
+        model = state.get("ai_model", "gpt-5.2")
+        socketio.emit("status_update", {"msg": f"✍️ {model} 집필 중..."}, broadcast=True)
+        ai_res = ""
+
+        if "gemini" in model.lower():
+            if not gemini_model: raise Exception("Gemini Key Missing")
+            from google.generativeai.types import HarmCategory, HarmBlockThreshold
+            safe = {HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
+                    HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
+                    HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
+                    HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE}
+            prompt = sys + "\n" + "\n".join(build_history_block()) + "\n" + round_block + "\nAI:"
+            ai_res = gemini_model.generate_content(prompt, safety_settings=safe).text
+        elif client:
+            res = client.chat.completions.create(model=model, messages=msgs, max_tokens=TARGET_MAX_TOKENS)
+            ai_res = res.choices[0].message.content
+        else:
+            ai_res = "API Key Error."
+
+        state["ai_history"].append(f"**Round**: {p1n}: {p1t} / {p2n}: {p2t}")
+        state["ai_history"].append(f"**AI**: {ai_res}")
+        state["pending_inputs"] = {}
+        save_data()
+
+        socketio.emit("ai_typewriter_event", {"content": ai_res}, broadcast=True)
+        emit_state_to_players()
+
+    except Exception as e:
+        socketio.emit("status_update", {"msg": f"Error: {e}"}, broadcast=True)
 
 # =========================
-# HTML_TEMPLATE (완성본)
+# HTML Template
 # =========================
 HTML_TEMPLATE = r"""<!DOCTYPE html>
 <html>
@@ -729,30 +570,20 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     .mini-del{background:#ff4444!important;}
 
     /* ===== 전체 글씨 검정 통일 (override) ===== */
-body, #main, #sidebar, #admin-modal, .modal-content,
-h1,h2,h3,h4,h5,h6,p,span,div,label,
-input,textarea,select,option{
-  color:#000 !important;
-}
-
-/* placeholder도 검정 계열(조금 연하게는 유지 가능) */
-textarea::placeholder, input::placeholder{
-  color: rgba(0,0,0,0.45) !important;
-  font-weight:700;
-}
-
-/* 모달 탭 버튼(비활성도 검정) */
-.tab-btn{ color:#000 !important; opacity:0.7; }
-.tab-btn.active{ opacity:1; }
-
-/* 상태줄/이름표도 검정 */
-#status, .name-tag, #role-display{ color:#000 !important; }
-
-/* 말풍선 텍스트도 검정 */
-.bubble, .user-bubble{ color:#000 !important; }
-
-/* 링크 기본 파란색 방지(백업 저장 링크 등) */
-a, a:visited { color:#000 !important; text-decoration:none; }
+    body, #main, #sidebar, #admin-modal, .modal-content,
+    h1,h2,h3,h4,h5,h6,p,span,div,label,
+    input,textarea,select,option{
+      color:#000 !important;
+    }
+    textarea::placeholder, input::placeholder{
+      color: rgba(0,0,0,0.45) !important;
+      font-weight:700;
+    }
+    .tab-btn{ color:#000 !important; opacity:0.7; }
+    .tab-btn.active{ opacity:1; }
+    #status, .name-tag, #role-display{ color:#000 !important; }
+    .bubble, .user-bubble{ color:#000 !important; }
+    a, a:visited { color:#000 !important; text-decoration:none; }
   </style>
 </head>
 
@@ -816,7 +647,6 @@ a, a:visited { color:#000 !important; text-decoration:none; }
             <button onclick="saveMaster()" class="save-btn" style="flex:0 0 auto;">저장</button>
           </div>
 
-          <!-- 순서: 백업/복원 -> 요약 -> 모델 -> (맨 아래) 시작/초기화 -->
           <div class="list-side" style="display:flex;flex-direction:column;min-height:0;">
             <label>세션 설정 / 백업</label>
 
@@ -976,23 +806,17 @@ a, a:visited { color:#000 !important; text-decoration:none; }
   }
 
   socket.on('connect', () => {
-    // 브라우저에 저장된 내 역할이 있는지 확인해
     const savedRole = localStorage.getItem('dream_role');
     socket.emit('join_game', { saved_role: savedRole });
 });
 
 socket.on('assign_role', payload => {
     myRole = payload.role;
-    // 역할을 부여받으면 브라우저에 저장! (새로고침 대비)
-    if(myRole && myRole !== 'readonly') {
+    if(myRole !== 'readonly') {
         localStorage.setItem('dream_role', myRole);
     }
-  socket.on('reload_signal', ()=> window.location.reload());
-
-  socket.on('assign_role', payload=>{
-    myRole = payload.role;
+    
     const roleEl = document.getElementById('role-display');
-
     if(payload.mode === 'readonly'){
       roleEl.innerText = "읽기 전용 모드(만석)";
       document.getElementById('msg-input').disabled = true;
@@ -1002,6 +826,8 @@ socket.on('assign_role', payload => {
     }
     roleEl.innerText = (myRole==='user1') ? "Player 1 (당신)" : "Player 2 (당신)";
   });
+
+  socket.on('reload_signal', ()=> window.location.reload());
 
   socket.on('status_update', d=>{
     const s = document.getElementById('status');
@@ -1307,5 +1133,17 @@ socket.on('assign_role', payload => {
 # Run
 # =========================
 if __name__ == "__main__":
-    print(f"✅ Running on http://{HOST}:{PORT}")
-    socketio.run(app, host=HOST, port=PORT, debug=False, allow_unsafe_werkzeug=True)
+    try:
+        import subprocess
+        subprocess.run(["pkill", "-9", "ngrok"])
+        ngrok.kill()
+
+        public_url = ngrok.connect(5000).public_url
+        print("\n" + "="*60)
+        print("🚀 서버가 시작되었습니다.")
+        print(f"🔗 접속 주소: {public_url}")
+        print("="*60 + "\n")
+
+        socketio.run(app, host="0.0.0.0", port=5000, allow_unsafe_werkzeug=True)
+    except Exception as e:
+        print(f"❌ 실행 오류: {e}")
