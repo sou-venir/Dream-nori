@@ -257,13 +257,22 @@ def import_config():
 # Socket: join / disconnect
 # =========================
 @socketio.on("join_game")
-def join_game(_=None):
+def join_game(data=None):
     sid = request.sid
+    saved_role = data.get("saved_role") if data else None
 
+    # 1. 새로고침한 유저가 기존 역할을 가지고 있는 경우 재연결
+    if saved_role in connected_users and connected_users[saved_role] is None:
+        connected_users[saved_role] = sid
+        emit("assign_role", {"role": saved_role, "mode": "player"})
+        emit_state_to_players()
+        return
+
+    # 2. 기존 로직 (신규 접속)
     for role, rsid in connected_users.items():
         if rsid == sid:
             emit("assign_role", {"role": role, "mode": "player"})
-            emit("initial_state", get_sanitized_state())
+            emit_state_to_players()
             return
 
     if connected_users["user1"] is None:
@@ -278,10 +287,11 @@ def join_game(_=None):
         emit_state_to_players()
         return
 
+    # 그 외는 읽기 전용
     readonly_sids.add(sid)
     emit("assign_role", {"role": "readonly", "mode": "readonly"})
-    emit("initial_state", {"session_title": state.get("session_title","드림놀이"), "theme": state.get("theme")})
-
+    emit("initial_state", get_sanitized_state())
+    
 @socketio.on("disconnect")
 def on_disconnect():
     sid = request.sid
@@ -605,16 +615,29 @@ def trigger_ai_from_pending():
     if "gemini" in current_model.lower():
         if gemini_model is None:
             raise Exception("Gemini API 키가 없습니다.")
+        
+        # 안전 설정 정의 (성인용/폭력 묘사 허용 범위 최대화)
+        from google.generativeai.types import HarmCategory, HarmBlockThreshold
+        safety_settings = {
+            # 성적인 내용은 차단 안 함
+            HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
+            # 괴롭힘, 증오 발언, 위험 요소는 아주 심각한 것(HIGH)만 차단
+            HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+            HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+            HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+        }
+
         prompt = system_content + "\n" + "\n".join(build_history_block()) + "\n" + round_block + "\nAI:"
-        res = genai.GenerativeModel(current_model).generate_content(prompt)
-        ai_response = res.text
-    else:
-        res = client.chat.completions.create(
-            model=current_model,
-            messages=messages,
-            max_tokens=TARGET_MAX_TOKENS
-        )
-        ai_response = res.choices[0].message.content
+        
+        try:
+            # 설정 적용하여 호출
+            res = genai.GenerativeModel(current_model).generate_content(
+                prompt, 
+                safety_settings=safety_settings
+            )
+            ai_response = res.text
+        except Exception as e:
+            ai_response = f"⚠️ AI 응답 생성 중 오류가 발생했습니다. (필터링 또는 연결 오류: {str(e)})"
 
     state["ai_history"].append(f"**Round**: {p1_name}: {p1_text} / {p2_name}: {p2_text}")
     state["ai_history"].append(f"**AI**: {ai_response}")
@@ -952,7 +975,18 @@ a, a:visited { color:#000 !important; text-decoration:none; }
     document.getElementById('tag-input').value="";
   }
 
-  socket.on('connect', ()=> socket.emit('join_game'));
+  socket.on('connect', () => {
+    // 브라우저에 저장된 내 역할이 있는지 확인해
+    const savedRole = localStorage.getItem('dream_role');
+    socket.emit('join_game', { saved_role: savedRole });
+});
+
+socket.on('assign_role', payload => {
+    myRole = payload.role;
+    // 역할을 부여받으면 브라우저에 저장! (새로고침 대비)
+    if(myRole && myRole !== 'readonly') {
+        localStorage.setItem('dream_role', myRole);
+    }
   socket.on('reload_signal', ()=> window.location.reload());
 
   socket.on('assign_role', payload=>{
@@ -1148,10 +1182,16 @@ a, a:visited { color:#000 !important; text-decoration:none; }
   function send(){
     const t = document.getElementById('msg-input').value.trim();
     if(!t) return;
+    
+    // [추가] 즉시 버튼과 입력창 비활성화
+    document.getElementById('msg-input').disabled = true;
+    document.getElementById('send-btn').disabled = true;
+    document.getElementById('skip-btn').disabled = true;
+    
     socket.emit('client_message', {uid: myRole, text: t});
     document.getElementById('msg-input').value='';
     socket.emit('stop_typing', {uid: myRole});
-  }
+}
 
   function skipTurn(){
     if(!confirm("이번 턴을 스킵할까?")) return;
