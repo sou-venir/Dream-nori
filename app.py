@@ -2,26 +2,43 @@ import os, json, copy, re
 from datetime import datetime
 from flask import Flask, render_template_string, request, Response
 from flask_socketio import SocketIO, emit
+from pyngrok import ngrok
 import openai
 import google.generativeai as genai
+from dotenv import load_dotenv  # .env 파일 로드용 (pip install python-dotenv 필요)
+
+# .env 파일이 있으면 로드 (로컬 실행 시 편리함)
+load_dotenv()
 
 # =========================
-# 1. 환경 변수 설정 (로컬/배포용)
+# Storage Setup (로컬 폴더 사용)
 # =========================
-HOST = os.getenv("HOST", "0.0.0.0")
-PORT = int(os.getenv("PORT", "5000"))
+# 구글 드라이브 대신 현재 폴더의 data 폴더 사용
+SAVE_PATH = os.path.join(os.getcwd(), 'data')
+os.makedirs(SAVE_PATH, exist_ok=True)
+DATA_FILE = os.path.join(SAVE_PATH, "save_data.json")
 
-# 데이터 저장 경로 (구글 드라이브 X -> 로컬 폴더 O)
-DATA_DIR = os.getenv("DATA_DIR", "./data")
-os.makedirs(DATA_DIR, exist_ok=True)
-DATA_FILE = os.path.join(DATA_DIR, "save_data.json")
+def save_data():
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
 
-# 관리자 비밀번호 (환경변수 없으면 기본값 3896)
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")
+def load_data():
+    if os.path.exists(DATA_FILE):
+        try:
+            with open(DATA_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except:
+            return None
+    return None
 
-# API 키 설정
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+# =========================
+# Keys & Setup (환경변수 사용)
+# =========================
+# userdata.get 대신 os.getenv 사용
+ADMIN_PASSWORD = os.getenv('ADMIN_PASSWORD', '3896') # 기본값 3896
+NGROK_TOKEN = os.getenv('NGROK_AUTH_TOKEN')
+OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
+GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
 
 # 키 확인 (OpenAI는 필수)
 if not OPENAI_API_KEY:
