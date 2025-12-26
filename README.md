@@ -9,7 +9,8 @@
 
 ## 필요한 것
 - **OpenAI API Key (유료)**: https://platform.openai.com/docs/quickstart  
-- **ngrok Auth Token (무료)**: https://dashboard.ngrok.com/get-started/your-authtoken  
+- **ngrok Auth Token (무료)**: https://dashboard.ngrok.com/get-started/your-authtoken
+- **Python (무료)**: [https://dashboard.ngrok.com/get-started/your-authtoken  ](https://www.python.org/downloads/)
 
 ---
 
