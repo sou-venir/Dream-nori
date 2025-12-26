@@ -50,7 +50,7 @@ initial_state = {
     "session_title": "드림놀이",
     "theme": {"bg": "#ffffff", "panel": "#f1f3f5", "accent": "#e91e63"},
     "ai_model": "gpt-5.2", 
-    "admin_password": ADMIN_PASSWORD_ENV,
+    "admin_password": ADMIN_PASSWORD,
     "solo_mode": False,
     "session_started": False,
     "profiles": {
