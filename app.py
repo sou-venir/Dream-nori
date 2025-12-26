@@ -806,17 +806,22 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   }
 
   socket.on('connect', () => {
+    // 로컬 스토리지에서 기존 역할이 있는지 확인
     const savedRole = localStorage.getItem('dream_role');
     socket.emit('join_game', { saved_role: savedRole });
-});
+  });
 
-socket.on('assign_role', payload => {
+  socket.on('reload_signal', ()=> window.location.reload());
+
+  socket.on('assign_role', payload=>{
     myRole = payload.role;
-    if(myRole !== 'readonly') {
+    // 역할을 로컬 스토리지에 저장 (새로고침 대비)
+    if(myRole && myRole !== 'readonly') {
         localStorage.setItem('dream_role', myRole);
     }
-    
+
     const roleEl = document.getElementById('role-display');
+
     if(payload.mode === 'readonly'){
       roleEl.innerText = "읽기 전용 모드(만석)";
       document.getElementById('msg-input').disabled = true;
@@ -826,8 +831,6 @@ socket.on('assign_role', payload => {
     }
     roleEl.innerText = (myRole==='user1') ? "Player 1 (당신)" : "Player 2 (당신)";
   });
-
-  socket.on('reload_signal', ()=> window.location.reload());
 
   socket.on('status_update', d=>{
     const s = document.getElementById('status');
