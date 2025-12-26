@@ -622,9 +622,9 @@ def trigger_ai_from_pending():
             # 성적인 내용은 차단 안 함
             HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
             # 괴롭힘, 증오 발언, 위험 요소는 아주 심각한 것(HIGH)만 차단
-            HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
-            HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_ONLY_HIGH,
-            HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+            HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
+            HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
+            HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
         }
 
         prompt = system_content + "\n" + "\n".join(build_history_block()) + "\n" + round_block + "\nAI:"
@@ -1183,11 +1183,10 @@ socket.on('assign_role', payload => {
     const t = document.getElementById('msg-input').value.trim();
     if(!t) return;
     
-    // [추가] 즉시 버튼과 입력창 비활성화
+    // 🔥 추가: 즉시 버튼 잠그기
+    document.getElementById('send-btn').disabled = true; 
     document.getElementById('msg-input').disabled = true;
-    document.getElementById('send-btn').disabled = true;
-    document.getElementById('skip-btn').disabled = true;
-    
+
     socket.emit('client_message', {uid: myRole, text: t});
     document.getElementById('msg-input').value='';
     socket.emit('stop_typing', {uid: myRole});
