@@ -1058,19 +1058,28 @@ a, a:visited { color:#000 !important; text-decoration:none; }
 """
 
 # =========================
-# Run
+# Run (윈도우/리눅스 공용 수정본)
 # =========================
 if __name__ == "__main__":
     try:
-        import subprocess
-        subprocess.run(["pkill", "-9", "ngrok"])
-        ngrok.kill()
+        # 윈도우에서 에러 나는 subprocess.run(["pkill"...]) 부분을 삭제했어!
         
-        # 🟢 NGROK 자동 연결 (URL 출력용)
+        # pyngrok 자체 명령으로 기존 세션 종료
+        try:
+            ngrok.kill()
+        except:
+            pass
+        
+        # ngrok 연결 시도
+        # 토큰이 없으면 여기서 에러가 날 수 있으니 체크해
+        if not os.getenv("NGROK_AUTH_TOKEN"):
+             print("⚠️ NGROK_AUTH_TOKEN이 설정되지 않았습니다. .env 파일이나 환경변수를 확인하세요.")
+        
         public_url = ngrok.connect(5000).public_url
         print("\n" + "="*60)
-        print(f"🚀 [드림놀이 최종완성] 서버 시작\n🔗 접속 주소: {public_url}")
+        print(f"🚀 [드림놀이 로컬서버] 가동 시작\n🔗 접속 주소: {public_url}")
         print("="*60 + "\n")
 
         socketio.run(app, host="0.0.0.0", port=5000, allow_unsafe_werkzeug=True)
-    except Exception as e: print(f"❌ 오류: {e}")
+    except Exception as e:
+        print(f"❌ 실행 오류: {e}")
