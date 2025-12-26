@@ -32,7 +32,7 @@
 압축을 푼 폴더에서 터미널(Windows는 `cmd`)을 열고 아래를 실행합니다.
 
 ```                           
-pip install -r requirements.txt
+pip install flask flask-socketio python-socketio pyngrok openai google-generativeai python-dotenv
 ```                        
 
 
