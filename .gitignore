@@ -1,22 +1,10 @@
-__pycache__/
-*.py[cod]
-*.egg-info/
-dist/
-build/
-
-.venv/
-venv/
-env/
-ENV/
-
-.vscode/
-.idea/
-
+# 환경변수 파일 (비밀번호, API키 들어있음 - 절대 업로드 금지)
 .env
-.env.*
-data/
-*.json
-*.log
 
-.DS_Store
-Thumbs.db
+# 데이터 저장 폴더
+data/
+save_data.json
+
+# 파이썬 캐시
+__pycache__/
+*.pyc
