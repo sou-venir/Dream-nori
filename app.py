@@ -81,7 +81,7 @@ def load_data():
 
 saved_state = load_data()
 state = saved_state if isinstance(saved_state, dict) else copy.deepcopy(initial_state)
-if ADMIN_PASSWORD_ENV: state["admin_password"] = ADMIN_PASSWORD_ENV
+if ADMIN_PASSWORD: state["admin_password"] = ADMIN_PASSWORD
 
 connected_users = {"user1": None, "user2": None}
 typing_users = set()
