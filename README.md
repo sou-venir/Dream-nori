@@ -6,10 +6,14 @@
 (일부 동작은 Gemini 계열 사용을 전제로 한 부분이 있어 환경에 따라 차이가 날 수 있습니다.)
 
 ---
+## 2.0.0 업데이트
 
+기존에는 ngrok 방식을 사용하였으나 pinggy 방식으로 바꾸었습니다.
+
+---
 ## 필요한 것
-- **OpenAI API Key (유료)**: https://platform.openai.com/docs/quickstart  
-- **ngrok Auth Token (무료)**: https://dashboard.ngrok.com/get-started/your-authtoken
+- **OpenAI API Key (유료)**: https://platform.openai.com/docs/quickstart
+- **Gemini API Key (무료 혹은 유료)**: https://aistudio.google.com/app/api-keys
 - **Python (무료)**: https://www.python.org/downloads/
 
 ---
@@ -33,7 +37,7 @@
 압축을 푼 폴더에서 터미널(Windows는 `cmd`)을 열고 아래를 실행합니다.
 
 ```                           
-pip install flask flask-socketio python-socketio pyngrok openai google-generativeai python-dotenv
+pip install flask flask-socketio python-socketio openai google-generativeai python-dotenv
 ```                        
 
 
@@ -43,7 +47,6 @@ pip install flask flask-socketio python-socketio pyngrok openai google-generativ
 ```                            
 OPENAI_API_KEY=발급받으신 openai api 키
 GEMINI_API_KEY=발급받으신 제미나이 api 키
-NGROK_AUTH_TOKEN=발급받으신 ngrok 토큰
 ADMIN_PASSWORD=내비밀번호
 ```
                         
@@ -52,7 +55,7 @@ ADMIN_PASSWORD=내비밀번호
 ```
 python app.py                       
 ```
-실행 후 콘솔에 표시되는 `https://xxxx.ngrok-free.app` 형태의 주소로 접속하시면 됩니다.  
+실행 후 콘솔에 표시되는 **`http://xxxx.pinggy.link`** 또는 **`https://...`** 형태의 주소로 접속하시면 됩니다.
 **두 분 모두 동일한 주소로 접속**해야 정상적으로 2인 세션이 진행됩니다.
 
 ---
@@ -60,6 +63,6 @@ python app.py
 ## 🔰 설치가 어려우신 경우(코랩 실행)
 1) 코랩 열기:  
 https://colab.research.google.com/github/sou-venir/Dream-nori/blob/main/%EC%BD%94%EB%9E%A9%EC%9D%84%EC%9C%84%ED%95%9C%EB%93%9C%EB%A6%BC%EB%86%80%EC%9D%B4.ipynb  
-2) 왼쪽 **열쇠(🔑)**에서 `OPENAI_API_KEY`, `NGROK_AUTH_TOKEN`, 'GEMINI_API_KEY', 'ADMIN_PASSWORD' 를 발급받으신 것으로 저장하고, **노트북 액세스**를 ON으로 변경합니다.  
+2) 왼쪽 **열쇠(🔑)**에서 `OPENAI_API_KEY`, 'GEMINI_API_KEY', 'ADMIN_PASSWORD' 를 발급받으신 것으로 저장하고, **노트북 액세스**를 ON으로 변경합니다.  
 3) **런타임 → 모두 실행**을 누릅니다.  
 4) 하단에 출력되는 접속 주소로 들어가시면 됩니다.
