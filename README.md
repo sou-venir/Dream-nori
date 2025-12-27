@@ -54,7 +54,8 @@ ADMIN_PASSWORD=내비밀번호
 
 ### 5) 실행    
 ```
-python app.py                       
+pip install -r requirements.txt
+python app.py                     
 ```
 실행 후 콘솔에 표시되는 **`http://xxxx.pinggy.link`** 또는 **`https://...`** 형태의 주소로 접속하시면 됩니다.
 **두 분 모두 동일한 주소로 접속**해야 정상적으로 2인 세션이 진행됩니다.
