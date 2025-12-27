@@ -90,8 +90,6 @@ else:
     state = copy.deepcopy(initial_state)
     client_map = {}
 
-state = saved_state if isinstance(saved_state, dict) else copy.deepcopy(initial_state)
-
 connected_users = {"user1": None, "user2": None}
 readonly_sids = set()
 admin_sids = set()
