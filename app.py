@@ -5,9 +5,15 @@ import subprocess
 import threading
 import time
 from datetime import datetime
-from dotenv import load_dotenv 
+from flask import Flask, render_template_string, request, Response
+from flask_socketio import SocketIO, emit
+import openai
+import google.generativeai as genai
+from dotenv import load_dotenv  # 추가! (.env 파일 읽기용)
 
-load_dotenv() 
+load_dotenv() # 추가!
+
+
 
 # =========================
 # Drive & Storage
@@ -39,10 +45,10 @@ ADMIN_PASSWORD = os.getenv('ADMIN_PASSWORD')
 
 gemini_model = None
 try:
-    OPENAI_API_KEY = os.getenv('OPENAI_API_KEY') # 수정
+    OPENAI_API_KEY = userdata.get('OPENAI_API_KEY')
     client = openai.OpenAI(api_key=OPENAI_API_KEY)
     try:
-        GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
+        GEMINI_API_KEY = userdata.get('GEMINI_API_KEY')
         if GEMINI_API_KEY:
             genai.configure(api_key=GEMINI_API_KEY)
             gemini_model = genai.GenerativeModel('gemini-3-pro-preview')
@@ -89,6 +95,7 @@ if saved_data:
 else:
     state = copy.deepcopy(initial_state)
     client_map = {}
+
 
 connected_users = {"user1": None, "user2": None}
 readonly_sids = set()
@@ -301,6 +308,19 @@ def on_disconnect():
     save_data()
     emit_state_to_players()
 
+@socketio.on("clear_all_roles")
+def clear_all_roles(data):
+    if str(data.get("password")) != str(state.get("admin_password")): return
+    
+    global client_map
+    client_map = {} # 모든 장치-역할 매핑 삭제
+    for role in connected_users:
+        connected_users[role] = None
+    
+    save_data()
+    socketio.emit("reload_signal") # 모든 클라이언트 새로고침 시켜서 재접속 유도
+
+
 @socketio.on("start_typing")
 def start_typing(data):
     uid = data.get("uid")
@@ -343,9 +363,24 @@ def save_master_base(data):
     state["prologue"] = (data.get("pro", state["prologue"]) or "")[:1000]
     state["summary"] = (data.get("sum", state["summary"]) or "")[:SUMMARY_MAX_CHARS]
     state["ai_model"] = data.get("model", state.get("ai_model","gpt-5.2"))
-    state["solo_mode"] = bool(data.get("solo_mode", state.get("solo_mode", False)))
+    
+    # 1인 모드 문자열 변환 버그 수정
+    val = data.get("solo_mode")
+    if val is not None:
+        state["solo_mode"] = (str(val).lower() == "true")
+        
     save_data()
     emit_state_to_players()
+
+# 프로필 잠금 해제 기능 추가
+@socketio.on("unlock_profile")
+def unlock_profile(data):
+    if str(data.get("password")) != str(state.get("admin_password")): return
+    target = data.get("target") # "user1" 또는 "user2"
+    if target in state["profiles"]:
+        state["profiles"][target]["locked"] = False
+        save_data()
+        emit_state_to_players()
 
 @socketio.on("theme_analyze_request")
 def theme_analyze_request(_=None):
@@ -466,9 +501,14 @@ def trigger_ai_from_pending():
     pending = state.get("pending_inputs", {})
     p1_text = pending.get("user1", {}).get("text", "(스킵)")
     p2_text = pending.get("user2", {}).get("text", "(스킵)")
-    p1_name = state["profiles"]["user1"].get("name","Player 1")
-    p2_name = state["profiles"]["user2"].get("name","Player 2")
+    
+    # [1] 플레이어 설정 데이터 가져오기
+    u1 = state["profiles"]["user1"]
+    u2 = state["profiles"]["user2"]
+    p1_name, p1_bio, p1_canon = u1.get("name", "Player 1"), u1.get("bio", ""), u1.get("canon", "")
+    p2_name, p2_bio, p2_canon = u2.get("name", "Player 2"), u2.get("bio", ""), u2.get("canon", "")
 
+    # [2] 로어(키워드) 매칭
     merged = f"{p1_text}\n{p2_text}"
     active_context = []
     for l in state.get("lorebook", []):
@@ -477,19 +517,59 @@ def trigger_ai_from_pending():
             active_context.append(f"[{l.get('title','')}]: {l.get('content','')}")
     active_context = active_context[:3]
 
-    system_content = f"{state.get('sys_prompt','')}\n\n[Summary]\n{state.get('summary','')}\n\n[Lore]\n" + "\n".join(active_context)
+    # [3] 프롬프트 조각 준비 (제목, 프롤로그, 프로필)
+    session_title = state.get("session_title", "Untitled Session")
+    sys_prompt = state.get('sys_prompt','')
+    prologue_text = state.get("prologue", "")
+
+    profile_content = (
+        f"### [CHARACTER PROFILES]\n"
+        f"1. {p1_name}\n- Bio: {p1_bio}\n- Relationship/Canon: {p1_canon}\n\n"
+        f"2. {p2_name}\n- Bio: {p2_bio}\n- Relationship/Canon: {p2_canon}"
+    )
+
+    # [4] 전체 시스템 프롬프트 조립 (Helper 함수)
+    def build_full_system_content():
+        return (
+            f"### [Session Title]: {session_title}\n\n"
+            f"{sys_prompt}\n\n"
+            f"{profile_content}\n\n"
+            f"### [PROLOGUE]\n{prologue_text}\n\n"
+            f"### [Current Summary]\n{state.get('summary','')}\n\n"
+            f"### [Active Lore]\n" + "\n".join(active_context)
+        )
+
+    system_content = build_full_system_content()
+    
+    # [5] 컨텍스트 오버플로우 체크 및 재조립
     if would_overflow_context(system_content + merged):
         auto_summary_apply()
-        system_content = f"{state.get('sys_prompt','')}\n\n[Summary]\n{state.get('summary','')}\n\n[Lore]\n" + "\n".join(active_context)
+        system_content = build_full_system_content()
 
-    round_block = f"--- [ROUND INPUT] ---\n<{p1_name}>: {p1_text}\n<{p2_name}>: {p2_text}\n--- [INSTRUCTION] ---\n두 행동은 동시간대입니다. 통합하여 2000자 내외로 서술하세요."
+    # [6] 답변 직전 강조 지침 (Recency Bias 활용)
+    priority_instruction = (
+        f"!!! [CRITICAL AUTHORITY] !!!\n"
+        f"위의 [Session Title], [PROLOGUE], [CHARACTER PROFILES] 설정을 완벽히 숙지하십시오. "
+        f"이전 대화보다 마스터의 지침과 캐릭터 설정을 최우선으로 하여 서술하십시오.\n\n"
+        f"[MANDATORY RULE]:\n{sys_prompt}"
+    )
 
+    round_block = f"--- [ROUND INPUT] ---\n<{p1_name}>: {p1_text}\n<{p2_name}>: {p2_text}\n--- [INSTRUCTION] ---\n두 행동은 동시간대입니다. 캐릭터 설정을 준수하여 2000자 내외로 서술하세요."
+
+    # [7] 메시지 리스트 구성
     messages = [{"role":"system","content":system_content}]
+    
+    # 예시 대화 (Few-shot)
     for ex in state.get("examples", []):
         if ex.get("q"): messages.extend([{"role":"user","content":ex["q"]}, {"role":"assistant","content":ex["a"]}])
+    
+    # 히스토리
     for h in build_history_block():
         messages.append({"role": "assistant" if h.startswith("**AI**") else "user", "content": h})
+    
+    # 이번 라운드 입력 + 강제 지침
     messages.append({"role":"user","content": round_block})
+    messages.append({"role": "system", "content": priority_instruction})
 
     current_model = state.get("ai_model","gpt-5.2")
     socketio.emit("status_update", {"msg": f"🤔 {current_model} 집필 중..."})
@@ -502,7 +582,8 @@ def trigger_ai_from_pending():
                     HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
                     HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
                     HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE}
-            prompt = system_content + "\n" + "\n".join(build_history_block()) + "\n" + round_block
+            # 제미나이용 프롬프트 조합
+            prompt = system_content + "\n" + "\n".join(build_history_block()) + "\n" + round_block + "\n\n" + priority_instruction
             ai_response = gemini_model.generate_content(prompt, safety_settings=safe).text
         elif client:
             res = client.chat.completions.create(model=current_model, messages=messages, max_tokens=TARGET_MAX_TOKENS)
@@ -519,7 +600,7 @@ def trigger_ai_from_pending():
 
     socketio.emit("ai_typewriter_event", {"content": ai_response})
     emit_state_to_players()
-
+    
 @socketio.on("client_message")
 def client_message(data):
     uid, text = data.get("uid"), (data.get("text") or "").strip()
@@ -629,7 +710,21 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         font-style: italic;
         color: inherit !important; /* 원래 글자색 따라감 */
     }
+    .bubble blockquote {
+        border-left: 4px solid var(--accent); /* 포인트 컬러로 옆줄 그어줌 */
+        margin: 10px 0;
+        padding: 5px 15px;
+        background: rgba(0,0,0,0.03); /* 아주 살짝 배경색 깔아줌 */
+        font-style: italic; /* 기울임꼴로 분위기 있게 */
+        color: rgba(0,0,0,0.7); /* 글자색은 살짝 투명하게 */
+    }
 
+    /* 오른쪽 말풍선(내꺼) 안의 인용구는 줄 색상을 하얗게 */
+    .align-right blockquote {
+        border-left: 4px solid rgba(255,255,255,0.5);
+        background: rgba(255,255,255,0.1);
+        color: rgba(255,255,255,0.9) !important;
+    }
     .edit-btn {
   background: transparent;
   border: 1px solid rgba(0,0,0,0.1);
@@ -733,6 +828,42 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   border-radius: 12px;
   cursor: not-allowed; /* 마우스 올리면 '금지' 표시는 뜨게 유지 */
 }
+
+   #t-lore.tab-content {
+    height: 100%;
+    overflow: hidden; /* 전체 스크롤 방지 */
+}
+
+#t-lore .editor-side {
+    flex: 1.2;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    height: 100%;
+    overflow: hidden;
+}
+
+#t-lore .list-side {
+    flex: 0.8;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    height: 100%;
+    overflow: hidden;
+    background: #fafafa;
+}
+    #lore-list {
+    flex: 1;
+    overflow-y: auto;
+    padding-right: 5px;
+}
+
+/* 상세 설정 입력창이 남은 모든 공간 차지 */
+#kw-c {
+    flex: 1;
+    min-height: 0 !important; /* flex-grow를 위해 필요 */
+    height: auto !important;
+}
     /* Override */
     body, #main, #sidebar, #admin-modal, .modal-content, h1,h2,h3,h4,h5,h6,p,span,div,label,input,textarea,select,option{ color:#000 !important; }
     textarea::placeholder, input::placeholder{ color: rgba(0,0,0,0.45) !important; font-weight:700; }
@@ -805,7 +936,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         </div>
 
         <div>
-          <textarea id="p-canon" maxlength="350" oninput="upCnt(this)" placeholder="관계 설정 (최대 350자)"></textarea>
+          <textarea id="p-canon" maxlength="350" oninput="upCnt(this)" placeholder="드림캐 설정 (최대 350자)"></textarea>
           <div id="cnt-p-canon" class="char-cnt">0/350</div>
         </div>
       </div>
@@ -840,31 +971,37 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             <div id="cnt-m-sys" class="char-cnt">0/4000</div>
             <button onclick="saveMaster()" class="save-btn" style="flex:0 0 auto;">저장</button>
           </div>
-          <div class="list-side" style="display:flex;flex-direction:column;min-height:0;">
-            <label>세션 설정 / 백업</label>
-            <div style="display:flex;gap:6px;">
-              <a href="/export" target="_blank" style="flex:1;">
-                <button style="width:100%;background:#444!important;" class="mini-btn">백업 저장</button>
-              </a>
-              <button onclick="document.getElementById('import-file').click()" style="flex:1;background:#666!important;" class="mini-btn">복원</button>
-              <input type="file" id="import-file" style="display:none;" accept=".json" onchange="uploadSessionFile(this)">
-            </div>
-            <textarea id="m-sum" class="short-textarea" maxlength="500" placeholder="현재 상황 요약(내부 기억용)"></textarea>
-            <label>AI 모델 선택</label>
-            <select id="m-ai-model">
-              <option value="gpt-5.2">OpenAI GPT-5.2</option>
-              <option value="gpt-4o">OpenAI GPT-4o</option>
-              <option value="gemini-3-pro-preview">Google Gemini 3 Pro</option>
-            </select>
-            <label>1인 플레이 모드 (테스트용)</label>
-            <select id="m-solo">
-              <option value="false">사용 안 함(2인)</option>
-              <option value="true">사용(1인)</option>
-            </select>
-            <div style="margin-top:auto; display:flex; gap:8px;">
-              <button id="start-session-btn" onclick="startSession()" class="save-btn" style="background:#444!important; display:none; flex:1;">세션 시작</button>
-              <button id="reset-session-btn" onclick="sessionReset()" class="btn-reset" style="display:none; flex:1;">세션 초기화</button>
-            </div>
+          <div class="list-side" style="display:flex;flex-direction:column;min-height:0; gap:12px;">
+    <label>서버 관리</label>
+    <button onclick="clearRoles()" style="width:100%; background:#ff9800 !important; color:white; font-weight:800;" class="mini-btn">접속 권한 전체 초기화</button>
+    <div style="display:flex; gap:4px;">
+    <button onclick="unlockProfile('user1')" style="flex:1; background:#44aaff !important; color:white; font-weight:800;" class="mini-btn">P1 잠금 해제</button>
+    <button onclick="unlockProfile('user2')" style="flex:1; background:#44aaff !important; color:white; font-weight:800;" class="mini-btn">P2 잠금 해제</button>
+</div>
+    
+    <label>세션 데이터</label>
+    <div style="display:flex;gap:6px;">
+        <a href="/export" target="_blank" style="flex:1;">
+            <button style="width:100%;background:#444!important;" class="mini-btn">백업 저장</button>
+        </a>
+        <button onclick="document.getElementById('import-file').click()" style="flex:1;background:#666!important;" class="mini-btn">복원</button>
+        <input type="file" id="import-file" style="display:none;" accept=".json" onchange="uploadSessionFile(this)">
+    </div>
+    
+    <label>현재 상황 요약</label>
+    <textarea id="m-sum" class="short-textarea" maxlength="500" placeholder="AI가 자동으로 요약하지만, 직접 수정도 가능합니다."></textarea>
+    
+    <label>AI 엔진 & 모드</label>
+    <select id="m-ai-model">
+        <option value="gpt-5.2">OpenAI GPT-5.2</option>
+        <option value="gpt-4o">OpenAI GPT-4o</option>
+        <option value="gemini-3-pro-preview">Google Gemini 3 Pro</option>
+    </select>
+    <select id="m-solo">
+        <option value="false">2인 플레이 모드</option>
+        <option value="true">1인 테스트 모드</option>
+    </select>
+</div>
           </div>
         </div>
         <!-- 서사 -->
@@ -1136,7 +1273,13 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     document.getElementById(id).classList.add('active');
     evt.currentTarget.classList.add('active');
   }
-
+  function clearRoles(){
+    const pw = prompt("관리자 비밀번호를 입력하세요. 모든 접속 권한이 해제되고 페이지가 새로고침됩니다.");
+    if(pw) {
+        socket.emit('clear_all_roles', {password: pw});
+    }
+}
+  
   const msgInput = document.getElementById('msg-input');
   msgInput.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && !e.shiftKey) {
@@ -1152,6 +1295,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     clearTimeout(typingTimer);
     typingTimer = setTimeout(()=> socket.emit('stop_typing', {uid: myRole}), 1200);
   });
+  function unlockProfile(target){
+    if(!confirm(target + "의 잠금을 해제하시겠습니까?")) return;
+    const pw = prompt("관리자 비밀번호 확인:");
+    if(pw) socket.emit('unlock_profile', {password: pw, target: target});
+}
 
   // [핵심] UI 갱신 함수 (모든 상태 반영)
   function refreshUI(){
@@ -1527,15 +1675,15 @@ if __name__ == "__main__":
         print("🚀 [드림놀이] Pinggy 서버 연결 중...")
         # Pinggy에 SSH로 포트 포워딩 연결 (엄격한 호스트 키 검사 비활성화)
         cmd = "ssh -o StrictHostKeyChecking=no -p 443 -R0:localhost:5000 a.pinggy.io"
-        
+
         # 프로세스 실행
         process = subprocess.Popen(
-            cmd, shell=True, 
-            stdout=subprocess.PIPE, 
-            stderr=subprocess.PIPE, 
+            cmd, shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True
         )
-        
+
         # 출력되는 로그에서 URL 찾기
         print("\n" + "="*50)
         print("🔗 아래 주소로 접속하세요 (잠시 후 뜹니다):")
