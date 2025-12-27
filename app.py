@@ -1,54 +1,69 @@
-import os, json, copy, re, time
+
+import urllib.parse
+import os, json, copy, re
+import subprocess
+import threading
+import time
 from datetime import datetime
-from flask import Flask, render_template_string, request, Response
-from flask_socketio import SocketIO, emit
-from pyngrok import ngrok
-import openai
-import google.generativeai as genai
-from dotenv import load_dotenv
+from dotenv import load_dotenv 
 
-# 1. 환경변수 로드
-load_dotenv()
+load_dotenv() 
 
-# 2. 설정 및 키 가져오기
-HOST = os.getenv("HOST", "0.0.0.0")
-PORT = int(os.getenv("PORT", "5000"))
-DATA_DIR = os.getenv("DATA_DIR", "./data")
-os.makedirs(DATA_DIR, exist_ok=True)
-DATA_FILE = os.path.join(DATA_DIR, "save_data.json")
+# =========================
+# Drive & Storage
+# =========================
+SAVE_PATH = os.path.join(os.getcwd(), 'data')
+os.makedirs(SAVE_PATH, exist_ok=True)
+DATA_FILE = os.path.join(SAVE_PATH, "save_data.json")
 
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "3896")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-NGROK_AUTH_TOKEN = os.getenv("NGROK_AUTH_TOKEN", "").strip()
+def save_data():
+    try:
+        with open(DATA_FILE, "w", encoding="utf-8") as f:
+            state_to_save = copy.deepcopy(state)
+            state_to_save["client_map"] = client_map
+            json.dump(state_to_save, f, ensure_ascii=False, indent=2)
+    except: pass
 
-# 3. AI 클라이언트 설정
-client = None
-if OPENAI_API_KEY:
-    client = openai.OpenAI(api_key=OPENAI_API_KEY)
+def load_data():
+    if os.path.exists(DATA_FILE):
+        try:
+            with open(DATA_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except: return None
+    return None
+
+# =========================
+# Keys & AI setup
+# =========================
+ADMIN_PASSWORD = os.getenv('ADMIN_PASSWORD')
 
 gemini_model = None
-if GEMINI_API_KEY:
+try:
+    OPENAI_API_KEY = os.getenv('OPENAI_API_KEY') # 수정
+    client = openai.OpenAI(api_key=OPENAI_API_KEY)
     try:
-        genai.configure(api_key=GEMINI_API_KEY)
-        gemini_model = genai.GenerativeModel('gemini-3-pro-preview')
-    except:
-        pass
+        GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
+        if GEMINI_API_KEY:
+            genai.configure(api_key=GEMINI_API_KEY)
+            gemini_model = genai.GenerativeModel('gemini-3-pro-preview')
+    except: pass
+except Exception as e:
+    print(f"❌ 설정 오류: {e}")
 
-# ngrok 토큰 설정 (있으면 등록)
-if NGROK_AUTH_TOKEN:
-    ngrok.set_auth_token(NGROK_AUTH_TOKEN)
-
-# 4. 앱 초기화
+# =========================
+# App
+# =========================
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
 socketio = SocketIO(app, cors_allowed_origins="*")
 
-# 5. 상태(State) 초기화
+# =========================
+# State
+# =========================
 initial_state = {
     "session_title": "드림놀이",
     "theme": {"bg": "#ffffff", "panel": "#f1f3f5", "accent": "#e91e63"},
-    "ai_model": "gpt-5.2", 
+    "ai_model": "gpt-5.2",
     "admin_password": ADMIN_PASSWORD,
     "solo_mode": False,
     "session_started": False,
@@ -65,30 +80,48 @@ initial_state = {
     "examples": [{"q": "", "a": ""}, {"q": "", "a": ""}, {"q": "", "a": ""}]
 }
 
-# 6. 저장소 로직
-def save_data():
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, indent=2)
+saved_data = load_data()
+if saved_data:
+    state = saved_data
+    # 기존 ip_map은 버리고 client_map(고유 ID용) 사용
+    state.pop("ip_map", None)
+    client_map = state.pop("client_map", {})
+else:
+    state = copy.deepcopy(initial_state)
+    client_map = {}
 
-def load_data():
-    if os.path.exists(DATA_FILE):
-        try:
-            with open(DATA_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except:
-            return None
-    return None
-
-saved_state = load_data()
 state = saved_state if isinstance(saved_state, dict) else copy.deepcopy(initial_state)
-if ADMIN_PASSWORD: state["admin_password"] = ADMIN_PASSWORD
 
 connected_users = {"user1": None, "user2": None}
-typing_users = set()
 readonly_sids = set()
 admin_sids = set()
+typing_users = set()
 
-# 7. 헬퍼 함수들
+# =========================
+# Helpers
+# =========================
+def sanitize_filename(name: str) -> str:
+    name = (name or "session").strip()
+    name = re.sub(r'[\\/:*?"<>|]+', "_", name)
+    return name[:60] or "session"
+
+def get_export_config_only():
+    return {
+        "session_title": state.get("session_title", ""),
+        "sys_prompt": state.get("sys_prompt", ""),
+        "prologue": state.get("prologue", ""),
+        "ai_model": state.get("ai_model", "gpt-5.2"),
+        "examples": state.get("examples", [{"q":"","a":""},{"q":"","a":""},{"q":"","a":""}]),
+        "lorebook": state.get("lorebook", []),
+        "solo_mode": bool(state.get("solo_mode", False)),
+        "_export_type": "dream_config_only_v1"
+    }
+
+def import_config_only(data: dict):
+    allow = {"session_title","sys_prompt","prologue","ai_model","examples","lorebook","solo_mode"}
+    for k in allow:
+        if k in data: state[k] = copy.deepcopy(data[k])
+
 def get_sanitized_state():
     safe = copy.deepcopy(state)
     safe["profiles"]["user1"]["bio"] = ""
@@ -97,35 +130,65 @@ def get_sanitized_state():
     safe["profiles"]["user2"]["canon"] = ""
     return safe
 
-def emit_state_to_players():
-    save_data()
+def emit_state_to_players(save=True):
+    if save: save_data()
     payload = get_sanitized_state()
     payload["pending_status"] = list(state.get("pending_inputs", {}).keys())
     payload["typing_status"] = list(typing_users)
-    socketio.emit("initial_state", payload) # 전체 브로드캐스트
+
+    # User1, User2에게 전송
+    if connected_users["user1"]: socketio.emit("initial_state", payload, room=connected_users["user1"])
+    if connected_users["user2"]: socketio.emit("initial_state", payload, room=connected_users["user2"])
+    # 관전자에게도 전송
+    for rsid in readonly_sids:
+        socketio.emit("initial_state", payload, room=rsid)
+
+# (1) ✅ analyze_theme_color() 함수 전체를 이걸로 교체 (OpenAI 전용 + 들여쓰기 정상)
 
 def analyze_theme_color(title, sys_prompt):
-    if not client: return state.get("theme")
+    prompt_text = (
+        f"세션 제목: {title}\n"
+        f"시스템/프롤로그: {sys_prompt[:1200]}\n\n"
+        "웹 UI 컬러 팔레트 전문가입니다.\n"
+        "텍스트는 항상 검정(#000000)입니다. bg/panel은 매우 밝고 대비가 높아야 합니다.\n"
+        "accent는 시나리오 분위기를 대표해야 합니다.\n"
+        "반드시 JSON만 반환: {\"bg\":\"#RRGGBB\",\"panel\":\"#RRGGBB\",\"accent\":\"#RRGGBB\"}"
+    )
     try:
+        if not client:
+            return state.get("theme")
+
         res = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role":"system","content":"JSON output only: {\"bg\":\"#Hex\",\"panel\":\"#Hex\",\"accent\":\"#Hex\"}"},
-                {"role":"user","content":f"Title: {title}\nPrompt: {sys_prompt[:800]}"}
+                {"role": "system", "content": "Return JSON only."},
+                {"role": "user", "content": prompt_text}
             ],
-            response_format={"type":"json_object"}
+            response_format={"type": "json_object"}
         )
-        return json.loads(res.choices[0].message.content)
-    except: return state.get("theme")
+        obj = json.loads(res.choices[0].message.content)
 
+        out = state.get("theme", {"bg": "#ffffff", "panel": "#f1f3f5", "accent": "#e91e63"})
+        for k in ("bg", "panel", "accent"):
+            v = obj.get(k)
+            if isinstance(v, str) and v.startswith("#") and len(v) == 7:
+                out[k] = v
+        return out
+
+    except Exception as e:
+        print(f"⚠️ 테마 분석 실패(OpenAI): {e}")
+        return state.get("theme")
+
+# Context / Summary
 MAX_CONTEXT_CHARS_BUDGET = 14000
 HISTORY_SOFT_LIMIT_CHARS = 9500
 SUMMARY_MAX_CHARS = 500
-TARGET_MAX_TOKENS = 1100 
+TARGET_MAX_TOKENS = 1100
 
 def build_history_block():
     history = state.get("ai_history", [])
-    collected, total = [], 0
+    collected = []
+    total = 0
     for msg in reversed(history):
         add_len = len(msg) + 1
         if total + add_len > HISTORY_SOFT_LIMIT_CHARS: break
@@ -139,152 +202,213 @@ def would_overflow_context(extra_incoming: str) -> bool:
     pro = state.get("prologue","")
     summ = state.get("summary","")
     hist = "\n".join(build_history_block())
-    rough = len(sys_p) + len(pro) + len(summ) + len(hist) + len(extra_incoming) + 2000
-    return rough > MAX_CONTEXT_CHARS_BUDGET
+    return (len(sys_p)+len(pro)+len(summ)+len(hist)+len(extra_incoming)+2000) > MAX_CONTEXT_CHARS_BUDGET
 
 def auto_summary_apply():
-    if not client: return
     def run_once():
         recent_log = "\n".join(state.get("ai_history", [])[-60:])
         if not recent_log: return None
-        try:
-            res = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[{"role":"user","content":f"Summarize in 2-3 sentences:\n{recent_log}"}]
-            )
-            return (res.choices[0].message.content or "").strip()
-        except: return None
+        res = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role":"user","content":f"요약해줘:\n{recent_log}"}]
+        )
+        return (res.choices[0].message.content or "").strip()
     try:
         s = run_once()
         if s: state["summary"] = s[:SUMMARY_MAX_CHARS]; save_data()
     except: pass
 
 # =========================
-# 8. Routes & Socket
+# Routes
 # =========================
 @app.route("/")
 def index():
     return render_template_string(HTML_TEMPLATE, theme=state.get("theme"))
 
+#여기까지 삭제
+
 @app.route("/export")
 def export_config():
-    cfg = {k: state.get(k) for k in ["session_title","sys_prompt","prologue","ai_model","examples","lorebook","solo_mode"]}
+    cfg = get_export_config_only()
     ts = datetime.now().strftime("%Y%m%d_%H%M")
-    fname = f"session_{ts}.json"
-    return Response(json.dumps(cfg, ensure_ascii=False, indent=2), mimetype="application/json", headers={"Content-Disposition": f"attachment;filename={fname}"})
+    safe_title = re.sub(r"[^A-Za-z0-9_-]+", "_", (cfg.get("session_title") or "session"))
+    fname = f"{safe_title}_{ts}.json"
+    data = json.dumps(cfg, ensure_ascii=False, indent=2)
+    resp = Response(data, mimetype="application/json; charset=utf-8")
+    resp.headers["Content-Disposition"] = "attachment; filename*=UTF-8''" + urllib.parse.quote(fname)
+    return resp
 
 @app.route("/import", methods=["POST"])
 def import_config():
     try:
-        data = json.load(request.files["file"])
-        for k in ["session_title","sys_prompt","prologue","ai_model","examples","lorebook","solo_mode"]:
-            if k in data: state[k] = copy.deepcopy(data[k])
-        save_data(); emit_state_to_players(); socketio.emit("reload_signal")
+        if "file" not in request.files: return "파일X", 400
+        file = request.files["file"]
+        if file.filename == "": return "파일X", 400
+        data = json.load(file)
+        import_config_only(data)
+        save_data()
+        emit_state_to_players()
         return "OK", 200
-    except: return "Error", 500
+    except Exception as e: return str(e), 500
 
+# =========================
+# Socket Logic (Fixed Session Restoration)
+# =========================
 @socketio.on("join_game")
 def join_game(data=None):
     sid = request.sid
-    saved_role = data.get("saved_role") if data else None
-    
-    if saved_role in connected_users and connected_users[saved_role] is None:
-        connected_users[saved_role] = sid
-        emit("assign_role", {"role": saved_role, "mode": "player"})
+    # 프론트엔드에서 보낸 고유 ID (UUID)
+    cid = (data or {}).get("client_id")
+
+    # 1. 이 ID가 이미 역할을 가지고 있는지 확인
+    if cid in client_map:
+        role = client_map[cid]
+        connected_users[role] = sid
+        emit("assign_role", {"role": role, "mode": "player", "source": "uuid"})
         emit_state_to_players()
         return
 
-    for role, rsid in connected_users.items():
-        if rsid == sid: emit("assign_role", {"role": role, "mode": "player"}); emit_state_to_players(); return
+    # 2. 빈 자리 찾기
+    target_role = None
+    if connected_users["user1"] is None: target_role = "user1"
+    elif connected_users["user2"] is None: target_role = "user2"
 
-    if connected_users["user1"] is None:
-        connected_users["user1"] = sid
-        emit("assign_role", {"role": "user1", "mode": "player"})
-    elif connected_users["user2"] is None:
-        connected_users["user2"] = sid
-        emit("assign_role", {"role": "user2", "mode": "player"})
-    else:
-        readonly_sids.add(sid)
-        emit("assign_role", {"role": "readonly", "mode": "readonly"})
+    if target_role:
+        connected_users[target_role] = sid
+        client_map[cid] = target_role # ID와 역할 매핑 저장
+        save_data()
+        emit("assign_role", {"role": target_role, "mode": "player", "source": "new"})
+        emit_state_to_players()
+        return
+
+    # 3. 만석
+    readonly_sids.add(sid)
+    emit("assign_role", {"role": "readonly", "mode": "readonly"})
     emit_state_to_players()
 
+
+# ✅ disconnect는 이 블록 하나만 남겨. (중복된 disconnect 데코레이터/함수는 삭제)
 @socketio.on("disconnect")
 def on_disconnect():
     sid = request.sid
     admin_sids.discard(sid)
-    for role in ("user1","user2"):
+
+    for role in ("user1", "user2"):
         if connected_users[role] == sid:
             connected_users[role] = None
             typing_users.discard(role)
             state.get("pending_inputs", {}).pop(role, None)
+
     readonly_sids.discard(sid)
-    save_data(); emit_state_to_players()
+    save_data()
+    emit_state_to_players()
 
 @socketio.on("start_typing")
 def start_typing(data):
     uid = data.get("uid")
-    if uid in ("user1","user2") and connected_users.get(uid) == request.sid:
-        typing_users.add(uid); emit_state_to_players()
+    if uid in ("user1","user2"):
+        typing_users.add(uid)
+        # broadcast=True 삭제
+        socketio.emit("typing_update", {"typing_users": list(typing_users)})
 
 @socketio.on("stop_typing")
 def stop_typing(data):
     uid = data.get("uid")
-    typing_users.discard(uid); emit_state_to_players()
+    if uid in ("user1","user2"):
+        typing_users.discard(uid)
+        # broadcast=True 삭제
+        socketio.emit("typing_update", {"typing_users": list(typing_users)})
+
+@socketio.on("edit_history_msg")
+def edit_history_msg(data):
+    try:
+        idx = int(data.get("index"))
+        text = data.get("text")
+        if 0 <= idx < len(state["ai_history"]):
+            # 기존 태그(**AI**: 등)가 사라지지 않게 처리할 수도 있지만,
+            # 여기서는 클라이언트가 보내준 전체 텍스트로 교체
+            state["ai_history"][idx] = text
+            save_data()
+            emit_state_to_players()
+    except: pass
 
 @socketio.on("check_admin")
 def check_admin(data):
-    if str(data.get("password")) == str(state.get("admin_password")):
-        admin_sids.add(request.sid); emit("admin_auth_res", {"success": True})
-    else: emit("admin_auth_res", {"success": False})
+    ok = str(data.get("password")) == str(state.get("admin_password"))
+    if ok: admin_sids.add(request.sid)
+    emit("admin_auth_res", {"success": ok})
 
 @socketio.on("save_master_base")
 def save_master_base(data):
-    if request.sid not in admin_sids: return
-    if "title" in data: state["session_title"] = data["title"]
-    if "sys" in data: state["sys_prompt"] = data["sys"]
-    if "pro" in data: state["prologue"] = data["pro"]
-    if "sum" in data: state["summary"] = data["sum"]
-    if "model" in data: state["ai_model"] = data["model"]
-    if "solo_mode" in data: state["solo_mode"] = data["solo_mode"]
-    save_data(); emit_state_to_players()
+    state["session_title"] = (data.get("title", state["session_title"]) or "")[:30]
+    state["sys_prompt"] = (data.get("sys", state["sys_prompt"]) or "")[:4000]
+    state["prologue"] = (data.get("pro", state["prologue"]) or "")[:1000]
+    state["summary"] = (data.get("sum", state["summary"]) or "")[:SUMMARY_MAX_CHARS]
+    state["ai_model"] = data.get("model", state.get("ai_model","gpt-5.2"))
+    state["solo_mode"] = bool(data.get("solo_mode", state.get("solo_mode", False)))
+    save_data()
+    emit_state_to_players()
 
 @socketio.on("theme_analyze_request")
 def theme_analyze_request(_=None):
-    if state["sys_prompt"]:
-        state["theme"] = analyze_theme_color(state["session_title"], state["sys_prompt"])
-        save_data(); emit_state_to_players(); socketio.emit("reload_signal")
+    if not (state.get("sys_prompt","").strip() and state.get("prologue","").strip()):
+        return
+    # prologue까지 합쳐서 분석 품질 올리기
+    combined = state.get("sys_prompt","") + "\n\n[PROLOGUE]\n" + state.get("prologue","")
+    state["theme"] = analyze_theme_color(state.get("session_title",""), combined)
+    save_data()
+    emit_state_to_players()
+
 
 @socketio.on("save_examples")
 def save_examples(data):
-    if request.sid not in admin_sids: return
-    state["examples"] = [{"q":d.get("q",""), "a":d.get("a","")} for d in data]
-    save_data(); emit_state_to_players()
+    out = []
+    for i in range(3):
+        ex = data[i] if i < len(data) else {"q":"","a":""}
+        out.append({"q": (ex.get("q","") or "")[:500], "a": (ex.get("a","") or "")[:500]})
+    state["examples"] = out
+    save_data()
+    emit_state_to_players()
 
 @socketio.on("update_profile")
 def update_profile(data):
     uid = data.get("uid")
-    if uid in state["profiles"]:
-        state["profiles"][uid].update({
-            "name": data.get("name")[:12],
-            "bio": data.get("bio")[:200],
-            "canon": data.get("canon")[:350],
-            "locked": True
-        })
-        save_data(); emit_state_to_players()
+    if uid not in ("user1","user2"): return
+    if connected_users.get(uid) != request.sid: return
+    if state["profiles"][uid].get("locked"): return
+    name = (data.get("name") or "").strip()
+    if not name: return
+    state["profiles"][uid]["name"] = name[:12]
+    state["profiles"][uid]["bio"] = (data.get("bio") or "")[:200]
+    state["profiles"][uid]["canon"] = (data.get("canon") or "")[:350]
+    state["profiles"][uid]["locked"] = True
+    save_data()
+    emit_state_to_players()
 
 @socketio.on("start_session")
 def start_session(_=None):
-    if request.sid in admin_sids:
-        state["session_started"] = True; save_data(); emit_state_to_players()
-        emit("status_update", {"msg": "✅ 세션이 시작되었습니다!"}, broadcast=True)
+    if request.sid not in admin_sids: return
+    if state.get("session_started"): return
+    state["session_started"] = True
+    save_data()
+    emit_state_to_players()
+    emit("status_update", {"msg": "✅ 세션이 시작되었습니다!"}, broadcast=True)
 
 @socketio.on("add_lore")
 def add_lore(data):
-    item = {"title":data.get("title")[:10], "triggers":data.get("triggers"), "content":data.get("content")[:400]}
     idx = int(data.get("index", -1))
+    title = (data.get("title","") or "")[:20]
+    triggers = (data.get("triggers","") or "")
+    content = (data.get("content","") or "")[:400]
+    item = {"title": title, "triggers": triggers, "content": content}
+    state.setdefault("lorebook", [])
+    if (idx < 0 or idx >= len(state["lorebook"])) and len(state["lorebook"]) >= 20:
+        emit("status_update", {"msg": "⚠️ 키워드북은 최대 20개까지 가능합니다."})
+        return
     if 0 <= idx < len(state["lorebook"]): state["lorebook"][idx] = item
     else: state["lorebook"].append(item)
-    save_data(); emit_state_to_players()
+    save_data()
+    emit_state_to_players()
 
 @socketio.on("del_lore")
 def del_lore(data):
@@ -299,81 +423,104 @@ def reorder_lore(data):
         save_data(); emit_state_to_players()
     except: pass
 
+# (서버) reset_session 이벤트를 아래로 교체
 @socketio.on("reset_session")
 def reset_session(data):
-    if str(data.get("password")) == str(state.get("admin_password")):
-        state["ai_history"] = []
-        state["lorebook"] = []
-        state["summary"] = ""
-        state["pending_inputs"] = {}
-        typing_users.clear()
-        state["session_started"] = False
-        state["profiles"]["user1"]["locked"] = False
-        state["profiles"]["user2"]["locked"] = False
-        save_data(); emit_state_to_players()
+    if str(data.get("password")) != str(state.get("admin_password")):
+        emit("status_update", {"msg": "❌ 비밀번호가 일치하지 않습니다."})
+        return
 
-# Chat & AI
+    # 1) 상태 전부 초기화(화면에 보이는 모든 입력값이 비게)
+    state["session_title"] = "드림놀이"
+    state["theme"] = {"bg": "#ffffff", "panel": "#f1f3f5", "accent": "#e91e63"}
+    state["ai_model"] = "gpt-5.2"
+    state["solo_mode"] = False
+    state["session_started"] = False
+
+    state["profiles"]["user1"] = {"name": "Player 1", "bio": "", "canon": "", "locked": False}
+    state["profiles"]["user2"] = {"name": "Player 2", "bio": "", "canon": "", "locked": False}
+
+    state["pending_inputs"] = {}
+    typing_users.clear()
+
+    state["ai_history"] = []
+    state["summary"] = ""
+    state["prologue"] = ""
+    state["sys_prompt"] = "당신은 숙련된 TRPG 마스터입니다."
+
+    state["lorebook"] = []
+    state["examples"] = [{"q": "", "a": ""}, {"q": "", "a": ""}, {"q": "", "a": ""}]
+
+    save_data()
+    emit_state_to_players()
+    emit("status_update", {"msg": "🧹 세션이 완전히 초기화되었습니다."}, broadcast=True)
+
 def record_pending(uid, text):
     state.setdefault("pending_inputs", {})
-    state["pending_inputs"][uid] = {"text": text[:600], "ts": datetime.now().isoformat()}
+    state["pending_inputs"][uid] = {"text": (text or "")[:600], "ts": datetime.now().isoformat()}
     save_data()
 
 def both_ready():
     if state.get("solo_mode"): return "user1" in state.get("pending_inputs", {})
     return "user1" in state.get("pending_inputs", {}) and "user2" in state.get("pending_inputs", {})
 
-def trigger_ai():
-    try:
-        pending = state.get("pending_inputs", {})
-        p1t, p2t = pending.get("user1", {}).get("text","(스킵)"), pending.get("user2", {}).get("text","(스킵)")
-        p1n, p2n = state["profiles"]["user1"]["name"], state["profiles"]["user2"]["name"]
-        
-        merged = f"{p1t}\n{p2t}"
-        active = []
-        for l in state.get("lorebook", []):
-            if any(t.strip() in merged for t in l["triggers"].split(",")):
-                active.append(f"[{l['title']}]: {l['content']}")
-        
-        sys = f"{state['sys_prompt']}\n\n[Summary]\n{state['summary']}\n\n[Lore]\n" + "\n".join(active[:3])
-        if would_overflow_context(sys + merged):
-            auto_summary_apply()
-            sys = f"{state['sys_prompt']}\n\n[Summary]\n{state['summary']}\n\n[Lore]\n" + "\n".join(active[:3])
-            
-        round_block = f"--- [ROUND INPUT] ---\n<{p1n}>: {p1t}\n<{p2n}>: {p2t}\n--- [INSTRUCTION] ---\n두 행동은 동시간대입니다. 통합하여 2000자 내외로 서술하세요."
-        
-        msgs = [{"role":"system", "content": sys}]
-        for ex in state.get("examples", []):
-            if ex["q"]: msgs.extend([{"role":"user","content":ex["q"]}, {"role":"assistant","content":ex["a"]}])
-        for h in build_history_block():
-            msgs.append({"role": "assistant" if h.startswith("**AI**") else "user", "content": h})
-        msgs.append({"role":"user","content": round_block})
+def trigger_ai_from_pending():
+    pending = state.get("pending_inputs", {})
+    p1_text = pending.get("user1", {}).get("text", "(스킵)")
+    p2_text = pending.get("user2", {}).get("text", "(스킵)")
+    p1_name = state["profiles"]["user1"].get("name","Player 1")
+    p2_name = state["profiles"]["user2"].get("name","Player 2")
 
-        model = state.get("ai_model", "gpt-5.2")
-        socketio.emit("status_update", {"msg": f"✍️ {model} 집필 중..."})
-        
-        ai_res = ""
-        if "gemini" in model.lower() and gemini_model:
+    merged = f"{p1_text}\n{p2_text}"
+    active_context = []
+    for l in state.get("lorebook", []):
+        triggers = [t.strip() for t in (l.get("triggers","")).split(",") if t.strip()]
+        if any(t in merged for t in triggers):
+            active_context.append(f"[{l.get('title','')}]: {l.get('content','')}")
+    active_context = active_context[:3]
+
+    system_content = f"{state.get('sys_prompt','')}\n\n[Summary]\n{state.get('summary','')}\n\n[Lore]\n" + "\n".join(active_context)
+    if would_overflow_context(system_content + merged):
+        auto_summary_apply()
+        system_content = f"{state.get('sys_prompt','')}\n\n[Summary]\n{state.get('summary','')}\n\n[Lore]\n" + "\n".join(active_context)
+
+    round_block = f"--- [ROUND INPUT] ---\n<{p1_name}>: {p1_text}\n<{p2_name}>: {p2_text}\n--- [INSTRUCTION] ---\n두 행동은 동시간대입니다. 통합하여 2000자 내외로 서술하세요."
+
+    messages = [{"role":"system","content":system_content}]
+    for ex in state.get("examples", []):
+        if ex.get("q"): messages.extend([{"role":"user","content":ex["q"]}, {"role":"assistant","content":ex["a"]}])
+    for h in build_history_block():
+        messages.append({"role": "assistant" if h.startswith("**AI**") else "user", "content": h})
+    messages.append({"role":"user","content": round_block})
+
+    current_model = state.get("ai_model","gpt-5.2")
+    socketio.emit("status_update", {"msg": f"🤔 {current_model} 집필 중..."})
+
+    ai_response = ""
+    try:
+        if "gemini" in current_model.lower() and gemini_model:
             from google.generativeai.types import HarmCategory, HarmBlockThreshold
             safe = {HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
                     HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
                     HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
                     HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE}
-            ai_res = gemini_model.generate_content(sys+"\n"+round_block, safety_settings=safe).text
+            prompt = system_content + "\n" + "\n".join(build_history_block()) + "\n" + round_block
+            ai_response = gemini_model.generate_content(prompt, safety_settings=safe).text
         elif client:
-            res = client.chat.completions.create(model=model, messages=msgs, max_tokens=TARGET_MAX_TOKENS)
-            ai_res = res.choices[0].message.content
+            res = client.chat.completions.create(model=current_model, messages=messages, max_tokens=TARGET_MAX_TOKENS)
+            ai_response = res.choices[0].message.content
         else:
-            ai_res = "API Key Error."
-
-        state["ai_history"].append(f"**Round**: {p1n}: {p1t} / {p2n}: {p2t}")
-        state["ai_history"].append(f"**AI**: {ai_res}")
-        state["pending_inputs"] = {}
-        save_data()
-        
-        socketio.emit("ai_typewriter_event", {"content": ai_res})
-        emit_state_to_players()
+            ai_response = "API Key Error."
     except Exception as e:
-        socketio.emit("status_update", {"msg": f"Error: {e}"})
+        ai_response = f"Error: {e}"
+
+    state["ai_history"].append(f"**Round**: {p1_name}: {p1_text} / {p2_name}: {p2_text}")
+    state["ai_history"].append(f"**AI**: {ai_response}")
+    state["pending_inputs"] = {}
+    save_data()
+
+    socketio.emit("ai_typewriter_event", {"content": ai_response})
+    emit_state_to_players()
 
 @socketio.on("client_message")
 def client_message(data):
@@ -382,11 +529,10 @@ def client_message(data):
     record_pending(uid, text)
     typing_users.discard(uid)
     emit_state_to_players()
-    
-    if both_ready(): trigger_ai()
+    if both_ready(): trigger_ai_from_pending()
     else:
-        other = "user2" if uid=="user1" else "user1"
-        nm = state["profiles"][other]["name"]
+        other = "user2" if uid == "user1" else "user1"
+        nm = state["profiles"][other].get("name", other)
         socketio.emit("status_update", {"msg": f"⏳ {nm}님 입력 대기... (스킵 가능)"})
 
 @socketio.on("skip_turn")
@@ -396,15 +542,17 @@ def skip_turn(data):
     record_pending(uid, "(스킵)")
     typing_users.discard(uid)
     emit_state_to_players()
-    if both_ready(): trigger_ai()
+    if both_ready(): trigger_ai_from_pending()
     else:
-        other = "user2" if uid=="user1" else "user1"
-        nm = state["profiles"][other]["name"]
+        other = "user2" if uid == "user1" else "user1"
+        nm = state["profiles"][other].get("name", other)
         socketio.emit("status_update", {"msg": f"⏳ {nm}님 입력 대기... (스킵 가능)"})
 
 # =========================
 # HTML Template
 # =========================
+
+
 HTML_TEMPLATE = r"""<!DOCTYPE html>
 <html>
 <head>
@@ -425,7 +573,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     body{font-family:Pretendard,sans-serif;display:flex;background:var(--bg);color:#000;}
     #main{flex:1;display:flex;flex-direction:column;height:100vh;border-right:1px solid rgba(0,0,0,0.05);min-width:0;}
     #chat-window{flex:1;overflow-y:auto;padding:30px 10%;display:flex;flex-direction:column;gap:15px;scroll-behavior:smooth;}
-    #chat-content{display:flex;flex-direction:column;gap:15px;}
+    #chat-content{display:flex;flex-direction:column;gap:15px;padding-bottom:20px;}
     #sidebar{width:320px;height:100vh;background:var(--panel);display:flex;flex-direction:column;overflow:hidden;}
     #sidebar-body{padding:20px;overflow-y:auto;flex:1;min-height:0;display:flex;flex-direction:column;gap:12px;}
     #sidebar-footer{padding:12px 20px 16px;border-top:1px solid rgba(0,0,0,0.06);background:var(--panel);}
@@ -437,12 +585,96 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     .btn-reset{background:#ff4444!important;}
     .master-btn{width:100%;background:transparent!important;color:#999!important;border:1px solid #ddd!important;padding:10px!important;border-radius:10px;font-weight:800;}
 
-    .bubble{padding:15px 20px;border-radius:15px;max-width:85%;line-height:1.6;font-size:14px;white-space:pre-wrap;background:rgba(0,0,0,0.03);}
-    .center-ai{align-self:center;background:var(--panel)!important;border-left:5px solid var(--accent);width:100%;max-width:800px;box-shadow:0 4px 15px rgba(0,0,0,0.05);}
-    .user-bubble{align-self:center;background:#eee;color:#666;font-size:12px;padding:6px 12px;border-radius:20px;max-width:85%;}
-    .name-tag{font-size:11px;color:#666;margin-bottom:6px;font-weight:700;}
+    /* [추가] 말풍선 좌우 정렬 스타일 */
+    .bubble {
+        padding: 8px 14px; /* 패딩을 조금 줄임 */
+        border-radius: 15px;
+        max-width: 85%;
+        width: fit-content;
+        text-align: left;
+        line-height: 1.5; /* 줄간격 약간 조정 */
+        font-size: 14px;
+        white-space: pre-wrap;
+        position: relative;
+        word-wrap: break-word;
+    }
+
+    /* [추가] 마크다운 때문에 생기는 불필요한 위아래 여백 제거 */
+    .bubble p {
+        margin: 0;
+    }
+    .bubble pre {
+  display: block;
+  background: #282c34;
+  color: #abb2bf;
+  padding: 12px;
+  border-radius: 8px;
+  overflow-x: auto;
+  margin: 8px 0;
+  font-family: 'Consolas', 'Monaco', monospace;
+  white-space: pre; /* 줄바꿈 유지 */
+  box-shadow: inset 0 0 10px rgba(0,0,0,0.2);
+}
+    .bubble code {
+  background: rgba(0,0,0,0.08);
+  padding: 2px 4px;
+  border-radius: 3px;
+  font-family: monospace;
+  font-size: 0.9em;
+}
+    .bubble pre code {
+  background: transparent;
+  padding: 0;
+  color: inherit;
+}
+    .bubble em, .bubble i {
+        font-style: italic;
+        color: inherit !important; /* 원래 글자색 따라감 */
+    }
+
+    .edit-btn {
+  background: transparent;
+  border: 1px solid rgba(0,0,0,0.1);
+  color: #999;
+  font-size: 10px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  margin-left: 8px;
+  cursor: pointer;
+}
+    .edit-btn:hover {
+  background: rgba(0,0,0,0.05);
+  color: var(--accent);
+}
+
+    .align-left { align-self: flex-start; background: rgba(0,0,0,0.04); color: #000; border-top-left-radius: 2px; }
+    .align-left .name-tag { color: #666; font-size: 11px; font-weight: bold; margin-bottom: 4px; }
+
+    .align-right { align-self: flex-end; background: var(--accent); color: #fff !important; border-top-right-radius: 2px; }
+    .align-right .name-tag { color: rgba(255,255,255,0.8); text-align: right; font-size: 11px; font-weight: bold; margin-bottom: 4px; }
+    .align-right p, .align-right span { color: #fff !important; }
+
+    .center-ai {
+    align-self: center; /* 플렉스박스에서 가운데 배치 */
+    background: var(--panel) !important;
+    border-left: 5px solid var(--accent);
+
+    width: fit-content;
+    max-width: 90%;
+
+    box-shadow: 0 4px 15px rgba(0,0,0,0.05);
+}
+    .center-ai .name-tag { font-weight:900; color:var(--accent); }
+
     .typing-anim{animation:blink 1.4s infinite;}
     @keyframes blink{50%{opacity:.45;}}
+
+    /* [추가] 글자수 카운터 스타일 */
+    .char-cnt { font-size: 10px; color: #888; text-align: right; margin-top: 2px; }
+
+    /* [요청] 입력창 높이 수정 */
+    #p-bio { height: 160px !important; }   /* 캐릭터 설정 */
+    #p-canon { height: 180px !important; } /* 관계 설정 (제일 크게) */
 
     /* modal */
     #admin-modal{display:none;position:fixed;z-index:10000;left:0;top:0;width:100vw;height:100vh;background:rgba(0,0,0,0.6);backdrop-filter:blur(5px);align-items:center;justify-content:center;padding:24px;box-sizing:border-box;}
@@ -482,32 +714,62 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     .mini-btn{padding:3px 7px;font-size:11px;border-radius:8px;}
     .mini-edit{background:#44aaff!important;}
     .mini-del{background:#ff4444!important;}
-
-    /* ===== 전체 글씨 검정 통일 (override) ===== */
-body, #main, #sidebar, #admin-modal, .modal-content,
-h1,h2,h3,h4,h5,h6,p,span,div,label,
-input,textarea,select,option{
-  color:#000 !important;
+    /* profile overlay fix (A: 입력 3개만 덮기) */
+    #profile-wrap {
+  position: relative; /* 오버레이 가두기 */
+  z-index: 0;         /* 스태킹 컨텍스트 생성 (뚫림 방지) */
+  overflow: hidden;   /* 튀어나감 방지 */
+  border-radius: 12px;
+  /* 여백이 없으면 오버레이가 너무 빡빡해 보일 수 있음. 살짝 줌 */
+  padding: 2px;
 }
 
-/* placeholder도 검정 계열(조금 연하게는 유지 가능) */
-textarea::placeholder, input::placeholder{
-  color: rgba(0,0,0,0.45) !important;
-  font-weight:700;
+    #profile-lock-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 100;
+
+  /* 여기를 투명으로 변경! */
+  background: transparent;
+
+  border-radius: 12px;
+  cursor: not-allowed; /* 마우스 올리면 '금지' 표시는 뜨게 유지 */
 }
+    /* Override */
+    body, #main, #sidebar, #admin-modal, .modal-content, h1,h2,h3,h4,h5,h6,p,span,div,label,input,textarea,select,option{ color:#000 !important; }
+    textarea::placeholder, input::placeholder{ color: rgba(0,0,0,0.45) !important; font-weight:700; }
+    .tab-btn{ color:#000 !important; opacity:0.7; } .tab-btn.active{ opacity:1; }
+    #status, .name-tag, #role-display{ color:#000 !important; }
+    a, a:visited { color:#000 !important; text-decoration:none; }
+    input:disabled::placeholder, textarea:disabled::placeholder {
+  color: transparent !important;
+}
+    .edit-mode-wrap {
+        width: 100%;
+        min-width: 300px;
+        display: flex;
+        flex-direction: column;
+        gap: 5px;
+    }
+    .edit-mode-textarea {
+        width: 100%;
+        height: 150px;
+        background: #fff;
+        border: 1px solid #ddd;
+        border-radius: 8px;
+        padding: 10px;
+        font-family: inherit;
+        font-size: 14px;
+        line-height: 1.5;
+        resize: vertical;
+    }
+    .edit-actions {
+        display: flex;
+        gap: 5px;
+        justify-content: flex-end;
+    }
 
-/* 모달 탭 버튼(비활성도 검정) */
-.tab-btn{ color:#000 !important; opacity:0.7; }
-.tab-btn.active{ opacity:1; }
 
-/* 상태줄/이름표도 검정 */
-#status, .name-tag, #role-display{ color:#000 !important; }
-
-/* 말풍선 텍스트도 검정 */
-.bubble, .user-bubble{ color:#000 !important; }
-
-/* 링크 기본 파란색 방지(백업 저장 링크 등) */
-a, a:visited { color:#000 !important; text-decoration:none; }
   </style>
 </head>
 
@@ -522,11 +784,7 @@ a, a:visited { color:#000 !important; text-decoration:none; }
         <textarea id="msg-input" maxlength="600" placeholder="행동을 입력하세요..."></textarea>
         <div style="display:flex;flex-direction:column;gap:8px;width:110px;">
           <button id="send-btn" onclick="send()" style="width:110px;">전송</button>
-          <button id="skip-btn" onclick="skipTurn()"
-            style="width:110px;background:transparent;color:#666;border:1px solid rgba(0,0,0,0.2);
-                   padding:6px 10px;font-size:12px;font-weight:800;">
-            스킵
-          </button>
+          <button id="skip-btn" onclick="skipTurn()" style="width:110px;background:transparent;color:#666;border:1px solid rgba(0,0,0,0.2);padding:6px 10px;font-size:12px;font-weight:800;">스킵</button>
         </div>
       </div>
     </div>
@@ -534,16 +792,30 @@ a, a:visited { color:#000 !important; text-decoration:none; }
 
   <div id="sidebar">
     <div id="sidebar-body">
-      <h3>설정</h3>
+      <h3>설정 <span id="role-badge" style="font-size:12px;color:var(--accent)"></span></h3>
       <div id="role-display" style="padding:10px;background:rgba(0,0,0,0.05);border-radius:8px;font-weight:800;color:#555;">접속 중...</div>
 
-      <input type="text" id="p-name" maxlength="12" placeholder="이름">
-      <textarea id="p-bio" maxlength="200" style="height:120px;" placeholder="캐릭터 설정(최대 200자)"></textarea>
-      <textarea id="p-canon" maxlength="350" style="height:80px;" placeholder="관계 설정(최대 350자)"></textarea>
+      <!-- 여기가 핵심: 잠금 기능을 위한 포장지 -->
+      <div id="profile-wrap">
+        <div id="profile-lock-overlay" style="display:none;"></div>
+
+        <input type="text" id="p-name" maxlength="12" placeholder="이름">
+
+        <div>
+          <textarea id="p-bio" maxlength="200" oninput="upCnt(this)" placeholder="캐릭터 설정 (최대 200자)"></textarea>
+          <div id="cnt-p-bio" class="char-cnt">0/200</div>
+        </div>
+
+        <div>
+          <textarea id="p-canon" maxlength="350" oninput="upCnt(this)" placeholder="관계 설정 (최대 350자)"></textarea>
+          <div id="cnt-p-canon" class="char-cnt">0/350</div>
+        </div>
+      </div>
+      <!-- //profile-wrap 끝 -->
 
       <button onclick="saveProfile()" id="ready-btn">설정 저장</button>
-      <div id="ready-status" style="font-size:11px;margin-top:5px;color:#666;">대기 중입니다...</div>
     </div>
+
     <div id="sidebar-footer">
       <button class="master-btn" onclick="requestAdmin()">마스터 설정</button>
     </div>
@@ -562,19 +834,16 @@ a, a:visited { color:#000 !important; text-decoration:none; }
       </div>
 
       <div class="modal-body">
-
         <!-- 엔진 -->
         <div id="t-base" class="tab-content active">
           <div class="editor-side" style="display:flex;flex-direction:column;min-height:0;">
             <label>시스템 프롬프트 (최대 4000자)</label>
-            <textarea id="m-sys" class="fill-textarea" maxlength="4000" style="flex:1;min-height:0;"></textarea>
+            <textarea id="m-sys" class="fill-textarea" maxlength="4000" oninput="upCnt(this)" style="flex:1;min-height:0;"></textarea>
+            <div id="cnt-m-sys" class="char-cnt">0/4000</div>
             <button onclick="saveMaster()" class="save-btn" style="flex:0 0 auto;">저장</button>
           </div>
-
-          <!-- 순서: 백업/복원 -> 요약 -> 모델 -> (맨 아래) 시작/초기화 -->
           <div class="list-side" style="display:flex;flex-direction:column;min-height:0;">
             <label>세션 설정 / 백업</label>
-
             <div style="display:flex;gap:6px;">
               <a href="/export" target="_blank" style="flex:1;">
                 <button style="width:100%;background:#444!important;" class="mini-btn">백업 저장</button>
@@ -582,40 +851,32 @@ a, a:visited { color:#000 !important; text-decoration:none; }
               <button onclick="document.getElementById('import-file').click()" style="flex:1;background:#666!important;" class="mini-btn">복원</button>
               <input type="file" id="import-file" style="display:none;" accept=".json" onchange="uploadSessionFile(this)">
             </div>
-
             <textarea id="m-sum" class="short-textarea" maxlength="500" placeholder="현재 상황 요약(내부 기억용)"></textarea>
-
             <label>AI 모델 선택</label>
             <select id="m-ai-model">
               <option value="gpt-5.2">OpenAI GPT-5.2</option>
               <option value="gpt-4o">OpenAI GPT-4o</option>
               <option value="gemini-3-pro-preview">Google Gemini 3 Pro</option>
             </select>
-
             <label>1인 플레이 모드 (테스트용)</label>
             <select id="m-solo">
               <option value="false">사용 안 함(2인)</option>
               <option value="true">사용(1인)</option>
             </select>
-
             <div style="margin-top:auto; display:flex; gap:8px;">
-              <button id="start-session-btn" onclick="startSession()" class="save-btn" style="background:#444!important; display:none; flex:1;">
-                세션 시작
-              </button>
-              <button id="reset-session-btn" onclick="sessionReset()" class="btn-reset" style="display:none; flex:1;">
-                세션 초기화
-              </button>
+              <button id="start-session-btn" onclick="startSession()" class="save-btn" style="background:#444!important; display:none; flex:1;">세션 시작</button>
+              <button id="reset-session-btn" onclick="sessionReset()" class="btn-reset" style="display:none; flex:1;">세션 초기화</button>
             </div>
           </div>
         </div>
-
         <!-- 서사 -->
         <div id="t-story" class="tab-content">
           <div class="editor-side">
             <label>세션 제목 (최대 30자)</label>
             <input type="text" id="m-title" maxlength="30">
             <label>프롤로그 (최대 1000자)</label>
-            <textarea id="m-pro" class="fill-textarea" maxlength="1000"></textarea>
+            <textarea id="m-pro" class="fill-textarea" maxlength="1000" oninput="upCnt(this)"></textarea>
+            <div id="cnt-m-pro" class="char-cnt">0/1000</div>
             <button onclick="saveMaster()" class="save-btn">저장</button>
           </div>
           <div class="list-side">
@@ -623,7 +884,6 @@ a, a:visited { color:#000 !important; text-decoration:none; }
             <p style="font-size:13px;color:#666;">프롬프트와 프롤로그가 모두 존재하면 모달 닫기 시 테마가 자동 분석됩니다.</p>
           </div>
         </div>
-
         <!-- 학습 -->
         <div id="t-ex" class="tab-content">
           <div class="editor-side">
@@ -646,29 +906,45 @@ a, a:visited { color:#000 !important; text-decoration:none; }
             <button onclick="saveExamples()" class="save-btn">저장</button>
           </div>
         </div>
-
-        <!-- 키워드 -->
+        <!-- 키워드 (UI 복구됨) -->
         <div id="t-lore" class="tab-content">
-          <div class="editor-side" style="display:flex;flex-direction:column;min-height:0;">
-            <label>키워드 이름 (최대 10자)</label>
-            <input type="text" id="kw-t" maxlength="10">
-            <label>트리거(최대 5개, Enter/Space)</label>
-            <div id="tag-container" onclick="focusTagInput()"><input type="text" id="tag-input" placeholder="입력 후 Enter/Space"></div>
-            <input type="hidden" id="tag-hidden" value="">
-            <input type="hidden" id="kw-index" value="-1">
-            <label>상세 설정 (최대 400자)</label>
-            <textarea id="kw-c" class="fill-textarea" maxlength="400" style="flex:1;min-height:0;"></textarea>
-            <button onclick="addLoreWithTags()" class="save-btn" style="flex:0 0 auto;">저장/수정</button>
-          </div>
-          <div class="list-side">
-            <label>키워드 목록</label>
-            <div id="lore-list" style="flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:8px;"></div>
-          </div>
-        </div>
+          <div class="editor-side">
+             <h3 style="margin:0 0 10px 0; font-size:16px;">키워드/설정 추가</h3>
 
-      </div>
-    </div>
-  </div>
+             <div>
+               <label style="font-size:12px; font-weight:bold; color:#888;">키워드 이름 (20자)</label>
+               <input type="text" id="kw-t" maxlength="20" placeholder="예: 마법학교, 절대반지">
+             </div>
+
+             <div>
+               <label style="font-size:12px; font-weight:bold; color:#888;">트리거 (엔터/스페이스로 추가)</label>
+               <div id="tag-container" onclick="focusTagInput()">
+                 <input type="text" id="tag-input" placeholder="대화에 이 단어가 나오면 AI가 기억합니다">
+               </div>
+               <input type="hidden" id="tag-hidden" value="">
+             </div>
+
+             <div style="flex:1; display:flex; flex-direction:column;">
+               <label style="font-size:12px; font-weight:bold; color:#888; margin-bottom:5px;">상세 설정 내용</label>
+               <textarea id="kw-c" class="fill-textarea" maxlength="400" oninput="upCnt(this)" placeholder="이 키워드에 대한 설명을 자유롭게 적어주세요."></textarea>
+               <div id="cnt-kw-c" class="char-cnt">0/400</div>
+             </div>
+
+             <input type="hidden" id="kw-index" value="-1">
+             <button onclick="addLoreWithTags()" class="save-btn">저장 / 수정 완료</button>
+          </div>
+
+          <div class="list-side">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+              <label style="font-weight:bold;">저장된 키워드</label>
+              <span style="font-size:11px; color:#888;">드래그로 우선순위 변경</span>
+            </div>
+            <div id="lore-list" style="flex:1; overflow-y:auto; display:flex; flex-direction:column; gap:8px;"></div>
+          </div>
+        </div> <!-- /#t-lore -->
+      </div> <!-- /.modal-body -->
+    </div>   <!-- /.modal-content -->
+  </div>     <!-- /#admin-modal -->
 
 <script>
   const socket = io();
@@ -678,12 +954,31 @@ a, a:visited { color:#000 !important; text-decoration:none; }
   let sortable = null;
   let isTypewriter = false;
 
+  // [추가] 현재 수정 중인 메시지의 인덱스 (-1이면 수정 중 아님)
+  let editingIdx = -1;
+
+  // [추가] 고유 ID 관리 (브라우저 신분증 - UUID)
+  function getClientId(){
+    let id = localStorage.getItem('dream_client_id');
+    if(!id){
+        id = Math.random().toString(36).substring(2) + Date.now().toString(36);
+        localStorage.setItem('dream_client_id', id);
+    }
+    return id;
+  }
+
   function mdToSafeHtml(mdText){
-    const raw = marked.parse(mdText || "");
+    const raw = marked.parse(mdText || "", {breaks: true});
     return DOMPurify.sanitize(raw, {USE_PROFILES: {html: true}});
   }
 
-  // tags
+  function upCnt(el){
+    const id = "cnt-"+el.id;
+    const c = document.getElementById(id);
+    if(c) c.innerText = el.value.length + "/" + el.getAttribute("maxlength");
+  }
+
+  // --- 태그/로어북 관련 함수 (그대로 유지) ---
   function focusTagInput(){ document.getElementById('tag-input')?.focus(); }
   function syncHidden(){ document.getElementById('tag-hidden').value = tags.join(','); }
   function renderTags(){
@@ -728,42 +1023,45 @@ a, a:visited { color:#000 !important; text-decoration:none; }
     document.getElementById('kw-index').value="-1";
     tags=[]; renderTags();
     document.getElementById('tag-input').value="";
+    upCnt(document.getElementById('kw-c'));
   }
 
+  // [수정] 접속 시 Client ID(UUID) 전송 -> 역할 고정용
   socket.on('connect', () => {
-    // 로컬 스토리지에서 기존 역할이 있는지 확인
-    const savedRole = localStorage.getItem('dream_role');
-    socket.emit('join_game', { saved_role: savedRole });
+    socket.emit('join_game', { client_id: getClientId() });
   });
 
   socket.on('reload_signal', ()=> window.location.reload());
 
   socket.on('assign_role', payload=>{
     myRole = payload.role;
-    // 역할을 로컬 스토리지에 저장 (새로고침 대비)
-    if(myRole && myRole !== 'readonly') {
-        localStorage.setItem('dream_role', myRole);
-    }
-
     const roleEl = document.getElementById('role-display');
+    const badgeEl = document.getElementById('role-badge');
 
     if(payload.mode === 'readonly'){
-      roleEl.innerText = "읽기 전용 모드(만석)";
+      roleEl.innerText = "관전자 모드 (자리가 꽉 찼습니다)";
+      if(badgeEl) badgeEl.innerText = "";
       document.getElementById('msg-input').disabled = true;
       document.getElementById('send-btn').disabled = true;
       document.getElementById('skip-btn').disabled = true;
       return;
     }
-    roleEl.innerText = (myRole==='user1') ? "Player 1 (당신)" : "Player 2 (당신)";
+
+    const who = (myRole==='user1') ? "Player 1" : "Player 2";
+    roleEl.innerText = who + " (당신)";
+    if(badgeEl) badgeEl.innerText = (myRole==='user1') ? "(P1)" : "(P2)";
   });
 
   socket.on('status_update', d=>{
     const s = document.getElementById('status');
-    s.innerHTML = d.msg;
-    s.style.color = d.msg.includes('❌') ? 'red' : 'var(--accent)';
+    // 준비 완료 상태 메시지는 refreshUI에서 덮어쓰므로,
+    // 여기선 일반적인 서버 메시지(AI 집필 중 등)만 처리
+    if(gState && gState.session_started){
+        s.innerHTML = d.msg;
+        s.style.color = d.msg.includes('❌') ? 'red' : 'var(--accent)';
+    }
   });
 
-  // typing effect
   socket.on('ai_typewriter_event', d=>{
     isTypewriter = true;
     const cc = document.getElementById('chat-content');
@@ -782,8 +1080,13 @@ a, a:visited { color:#000 !important; text-decoration:none; }
       if(i >= full.length){
         clearInterval(tick);
         isTypewriter = false;
+        refreshUI();
       }
     }, 20);
+  });
+
+  socket.on('typing_update', d => {
+    refreshUI(); // 타이핑 상태도 UI 갱신으로 통합 처리
   });
 
   socket.on('admin_auth_res', d=>{
@@ -807,7 +1110,6 @@ a, a:visited { color:#000 !important; text-decoration:none; }
 
   socket.on('initial_state', data=>{
     gState = data;
-
     if(data.theme){
       const root = document.documentElement.style;
       root.setProperty('--bg', data.theme.bg);
@@ -837,8 +1139,14 @@ a, a:visited { color:#000 !important; text-decoration:none; }
     evt.currentTarget.classList.add('active');
   }
 
-  // typing indicator emit
   const msgInput = document.getElementById('msg-input');
+  msgInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      send();
+    }
+  });
+
   let typingTimer = null;
   msgInput.addEventListener('input', ()=>{
     if(!myRole || myRole==='readonly') return;
@@ -847,78 +1155,218 @@ a, a:visited { color:#000 !important; text-decoration:none; }
     typingTimer = setTimeout(()=> socket.emit('stop_typing', {uid: myRole}), 1200);
   });
 
+  // [핵심] UI 갱신 함수 (모든 상태 반영)
   function refreshUI(){
     if(!gState) return;
 
+    // --- [1] 상태 텍스트 (Status Bar) 로직 수정 ---
+    const statusEl = document.getElementById('status');
+    const p1 = gState.profiles.user1 || {};
+    const p2 = gState.profiles.user2 || {};
+
+    let stHtml = "대기 중...";
+
+    if (!gState.session_started) {
+        // 세션 시작 전
+        let p1Ready = p1.locked ? "✅" : "⏳";
+        let p2Ready = p2.locked ? "✅" : "⏳";
+        let p1Name = p1.name || "P1";
+        let p2Name = p2.name || "P2";
+
+        if(p1.locked && p2.locked) {
+            stHtml = "<span style='color:#00aa00; font-weight:900;'>✨ 모든 플레이어 준비 완료! (마스터가 시작을 눌러주세요)</span>";
+        } else {
+            stHtml = `${p1Ready} ${p1Name} / ${p2Ready} ${p2Name} (설정 중...)`;
+        }
+    } else {
+        // 세션 시작 후
+        const typers = (gState.typing_status||[]);
+        const pends = (gState.pending_status||[]);
+        const other = (myRole==='user1')?'user2':'user1';
+        const otherName = gState.profiles?.[other]?.name || "상대";
+
+        // [핵심 변경] 두 명 다 입력 완료 상태면 AI 집필 중 표시
+        if (pends.includes('user1') && pends.includes('user2')) {
+            const modelName = gState.ai_model || "AI";
+            stHtml = `<span style="color:var(--accent); font-weight:900;">🤔 ${modelName} 집필 중...</span>`;
+        }
+        else if(typers.includes(other)) {
+            stHtml = `<span class="typing-anim">${otherName} 입력 중...</span>`;
+        }
+        else if(pends.includes(other)) {
+            stHtml = `✅ ${otherName} 입력 완료 (당신의 차례)`;
+        }
+        else {
+            stHtml = "행동을 입력하세요.";
+        }
+        // "나도 완료" 부분 제거함
+    }
+    statusEl.innerHTML = stHtml;
+
+    // --- [2] 입력창 잠금 로직 ---
     const msg = document.getElementById('msg-input');
     const sendBtn = document.getElementById('send-btn');
     const skipBtn = document.getElementById('skip-btn');
 
-    if(myRole==='readonly'){
-      msg.disabled=true; sendBtn.disabled=true; skipBtn.disabled=true;
-    } else {
-      if(gState.session_started){
-        msg.disabled=false; msg.placeholder="행동을 입력하세요...";
-      } else {
-        msg.disabled=true; msg.placeholder="프로필 확정 후 마스터가 세션을 시작합니다.";
-      }
-    }
+    const pends = (gState.pending_status||[]);
+    const myDone = pends.includes(myRole);
+    const shouldLock = myDone || !gState.session_started || myRole==='readonly';
 
-    // chat render
+    if(msg.disabled !== shouldLock) msg.disabled = shouldLock;
+    if(sendBtn.disabled !== shouldLock) sendBtn.disabled = shouldLock;
+    if(skipBtn.disabled !== shouldLock) skipBtn.disabled = shouldLock;
+
+    if(!gState.session_started) msg.placeholder = "캐릭터 설정을 완료하고 저장을 눌러주세요.";
+    else if(!shouldLock) msg.placeholder = "행동을 입력하세요...";
+
+    // --- [3] 채팅 렌더링 ---
     const cc = document.getElementById('chat-content');
+
     let html = `<div style="text-align:center;padding:20px;color:var(--accent);font-weight:bold;font-size:1.4em;">${gState.session_title}</div>`;
     html += `<div class="bubble center-ai"><div class="name-tag">PROLOGUE</div>${mdToSafeHtml(gState.prologue||"")}</div>`;
 
-    (gState.ai_history||[]).forEach(m=>{
+    // 3-1. 확정된 역사(History) 렌더링
+    (gState.ai_history||[]).forEach((m, idx) => {
+      // 수정 모드
+      if(idx === editingIdx) {
+        let rawText = m;
+        if(rawText.startsWith("**AI**:")) rawText = rawText.replace("**AI**:","").trim();
+        html += `
+            <div class="bubble center-ai" style="width:90%;">
+                <div class="name-tag">EDIT MODE</div>
+                <div class="edit-mode-wrap">
+                    <textarea id="edit-area-${idx}" class="edit-mode-textarea">${rawText}</textarea>
+                    <div class="edit-actions">
+                        <button class="mini-btn" style="background:#888" onclick="cancelEdit()">취소</button>
+                        <button class="mini-btn" style="background:var(--accent);color:#fff" onclick="saveEdit(${idx})">저장</button>
+                    </div>
+                </div>
+            </div>`;
+        return;
+      }
+
+      // 일반 모드
+      let content = "";
+      let nameHtml = "";
+      let alignClass = "align-left";
+
       if(m.startsWith("**AI**:")){
-        html += `<div class="bubble center-ai"><div class="name-tag">AI</div>${mdToSafeHtml(m.replace("**AI**:","").trim())}</div>`;
+        const text = m.replace("**AI**:","").trim();
+        alignClass = "center-ai";
+        nameHtml = `<div class="name-tag">AI <button class="edit-btn" onclick="startEdit(${idx})">수정</button></div>`;
+        content = mdToSafeHtml(text);
       } else if(m.startsWith("**Round**:")){
-        html += `<div class="user-bubble">${mdToSafeHtml(m.replace("**Round**:","").trim())}</div>`;
+        const raw = m.replace("**Round**:", "").trim();
+        const parts = raw.split(" / ");
+        let roundHtml = "";
+        parts.forEach(p => {
+            const sep = p.indexOf(":");
+            if(sep > -1){
+                const name = p.substring(0, sep).trim();
+                const body = p.substring(sep+1).trim();
+                const myProfileName = gState.profiles[myRole]?.name;
+                const isMe = (name === myProfileName);
+                const subAlign = isMe ? "align-right" : "align-left";
+                roundHtml += `<div class="bubble ${subAlign}"><div class="name-tag">${name}</div>${mdToSafeHtml(body)}</div>`;
+            } else {
+                roundHtml += `<div class="bubble align-left">${mdToSafeHtml(p)}</div>`;
+            }
+        });
+        html += roundHtml;
+        return;
       } else {
-        html += `<div class="user-bubble">${mdToSafeHtml(m)}</div>`;
+        content = mdToSafeHtml(m);
+      }
+
+      if(!m.startsWith("**Round**:")){
+         html += `<div class="bubble ${alignClass}">${nameHtml}${content}</div>`;
       }
     });
-    cc.innerHTML = html;
-    document.getElementById('chat-window').scrollTop = document.getElementById('chat-window').scrollHeight;
 
-    // status text
-    const pends = (gState.pending_status||[]);
-    const typers = (gState.typing_status||[]);
-    const other = (myRole==='user1')?'user2':'user1';
-    const otherName = gState.profiles?.[other]?.name || "상대";
+    // 3-2. [핵심 변경] 실시간 입력 메시지 (시간순 정렬)
+    // 딕셔너리를 배열로 변환
+    let pendingMsgs = [];
+    if(gState.pending_inputs){
+        Object.keys(gState.pending_inputs).forEach(uid => {
+            const item = gState.pending_inputs[uid];
+            // 텍스트가 있는 경우만
+            if(item && item.text){
+                pendingMsgs.push({
+                    uid: uid,
+                    text: item.text,
+                    ts: item.ts || "" // 타임스탬프
+                });
+            }
+        });
+    }
 
-    let st = "대기 중...";
-    if(typers.includes(other)) st = `<span class="typing-anim">${otherName} 입력 중...</span>`;
-    else if(pends.includes(other)) st = `✅ ${otherName} 입력 완료`;
-    if(pends.includes(myRole)) st += " / 나도 완료";
-    document.getElementById('status').innerHTML = st;
+    // 타임스탬프 기준 오름차순 정렬 (먼저 친 게 위로)
+    pendingMsgs.sort((a, b) => {
+        if (a.ts < b.ts) return -1;
+        if (a.ts > b.ts) return 1;
+        return 0;
+    });
 
-    // prevent duplicate submit
-    const myDone = pends.includes(myRole);
-    sendBtn.disabled = myDone || !gState.session_started || myRole==='readonly';
-    skipBtn.disabled = myDone || !gState.session_started || myRole==='readonly';
+    // 정렬된 순서대로 렌더링
+    pendingMsgs.forEach(msg => {
+        const uName = gState.profiles[msg.uid].name;
+        const isMe = (msg.uid === myRole);
+        const align = isMe ? "align-right" : "align-left";
 
-    // profile restore
+        html += `<div class="bubble ${align}"><div class="name-tag">${uName}</div>${mdToSafeHtml(msg.text)}</div>`;
+    });
+
+    if(cc.innerHTML !== html) {
+        cc.innerHTML = html;
+        if(editingIdx === -1) {
+            document.getElementById('chat-window').scrollTop = document.getElementById('chat-window').scrollHeight;
+        }
+    }
+
+    // --- [4] 프로필 복원 ---
     const p = (myRole && gState.profiles && gState.profiles[myRole]) ? gState.profiles[myRole] : {name:"",bio:"",canon:"",locked:false};
     const activeId = document.activeElement?.id || "";
-    if(activeId!=='p-name') document.getElementById('p-name').value = p.name || "";
-    if(activeId!=='p-bio') document.getElementById('p-bio').value = p.bio || "";
-    if(activeId!=='p-canon') document.getElementById('p-canon').value = p.canon || "";
+
+    if(activeId!=='p-name' && (!document.getElementById('p-name').value || p.locked))
+        document.getElementById('p-name').value = p.name || "";
+
+    if(p.locked || (activeId!=='p-bio' && !document.getElementById('p-bio').value)) {
+         document.getElementById('p-bio').value = p.bio || "";
+         upCnt(document.getElementById('p-bio'));
+    }
+    if(p.locked || (activeId!=='p-canon' && !document.getElementById('p-canon').value)) {
+         document.getElementById('p-canon').value = p.canon || "";
+         upCnt(document.getElementById('p-canon'));
+    }
 
     const locked = !!p.locked;
+    const overlay = document.getElementById('profile-lock-overlay');
+    if(overlay) overlay.style.display = locked ? 'block' : 'none';
     const disableProfile = (myRole==='readonly') || locked;
     document.getElementById('p-name').readOnly = disableProfile;
-    document.getElementById('p-bio').readOnly = disableProfile;
-    document.getElementById('p-canon').readOnly = disableProfile;
+    document.getElementById('p-name').disabled = disableProfile;
+    document.getElementById('p-bio').disabled = disableProfile;
+    document.getElementById('p-canon').disabled = disableProfile;
+
     const rb = document.getElementById('ready-btn');
     rb.disabled = disableProfile;
     rb.innerText = locked ? "설정이 확정되었습니다" : "설정 저장";
 
-    // admin restore
+    const roleEl = document.getElementById('role-display');
+    const badgeEl = document.getElementById('role-badge');
+
+    if(myRole && myRole !== 'readonly'){
+        let who = (myRole==='user1') ? "Player 1" : "Player 2";
+        roleEl.innerText = who + " (당신)";
+        if(badgeEl) badgeEl.innerText = (myRole==='user1') ? "(P1)" : "(P2)";
+    }
+
+    // --- [5] 마스터 데이터 복원 ---
     if(activeId!=='m-title') document.getElementById('m-title').value = gState.session_title || "";
-    if(activeId!=='m-sys') document.getElementById('m-sys').value = gState.sys_prompt || "";
-    if(activeId!=='m-pro') document.getElementById('m-pro').value = gState.prologue || "";
+    if(activeId!=='m-sys') { document.getElementById('m-sys').value = gState.sys_prompt || ""; upCnt(document.getElementById('m-sys')); }
+    if(activeId!=='m-pro') { document.getElementById('m-pro').value = gState.prologue || ""; upCnt(document.getElementById('m-pro')); }
     if(activeId!=='m-sum') document.getElementById('m-sum').value = gState.summary || "";
+
     document.getElementById('m-ai-model').value = gState.ai_model || "gpt-5.2";
     document.getElementById('m-solo').value = gState.solo_mode ? "true" : "false";
 
@@ -929,33 +1377,47 @@ a, a:visited { color:#000 !important; text-decoration:none; }
         if(activeId!==`ex-a-${i}`) document.getElementById(`ex-a-${i}`).value = ex.a || "";
       }
     }
-
+    if(activeId!=='kw-c') upCnt(document.getElementById('kw-c'));
     renderLoreList();
+  }
+
+
+  // [추가] 수정 모드 제어 함수들
+  function startEdit(idx){
+    editingIdx = idx;
+    refreshUI();
+  }
+  function cancelEdit(){
+    editingIdx = -1;
+    refreshUI();
+  }
+  function saveEdit(idx){
+    const txt = document.getElementById(`edit-area-${idx}`).value;
+    // AI 접두사 다시 붙여서 전송
+    socket.emit('edit_history_msg', {index: idx, text: "**AI**: " + txt});
+    editingIdx = -1;
   }
 
   function send(){
     const t = document.getElementById('msg-input').value.trim();
     if(!t) return;
-
-    // 🔥 추가: 즉시 버튼 잠그기
     document.getElementById('send-btn').disabled = true;
     document.getElementById('msg-input').disabled = true;
-
     socket.emit('client_message', {uid: myRole, text: t});
     document.getElementById('msg-input').value='';
     socket.emit('stop_typing', {uid: myRole});
-}
+  }
 
   function skipTurn(){
-    if(!confirm("이번 턴을 스킵할까?")) return;
+    if(!confirm("스킵?")) return;
     socket.emit('skip_turn', {uid: myRole});
     socket.emit('stop_typing', {uid: myRole});
   }
 
   function saveProfile(){
     const name = document.getElementById('p-name').value;
-    if(!name || name.includes("Player")) return alert("캐릭터 이름을 입력하세요.");
-    if(confirm("이 설정으로 확정하시겠습니까? (확정 후 수정 불가)")){
+    if(!name) return alert("이름 필수");
+    if(confirm("확정하시겠습니까? (수정 불가)")){
       socket.emit('update_profile', {
         uid: myRole,
         name,
@@ -974,15 +1436,22 @@ a, a:visited { color:#000 !important; text-decoration:none; }
       model: document.getElementById('m-ai-model').value,
       solo_mode: (document.getElementById('m-solo').value === "true")
     });
-    alert("설정이 저장되었습니다.");
+    alert("저장됨");
   }
 
   function startSession(){ socket.emit('start_session'); }
   function sessionReset(){
-    if(confirm("정말로 초기화하시겠습니까?")){
-      const pw = prompt("관리자 비밀번호를 입력하세요:");
-      if(pw) socket.emit('reset_session', {password: pw});
-    }
+    if(!confirm("정말로 초기화하시겠습니까?")) return;
+    const pw = prompt("관리자 비밀번호를 입력하세요:");
+    if(!pw) return;
+    socket.emit('reset_session', {password: pw});
+    try{
+      document.getElementById('chat-content').innerHTML = "";
+      document.getElementById('msg-input').value = "";
+      clearLoreEditor();
+    } catch(e){}
+    const modal = document.getElementById('admin-modal');
+    if(modal) modal.style.display = 'none';
   }
 
   function saveExamples(){
@@ -991,7 +1460,7 @@ a, a:visited { color:#000 !important; text-decoration:none; }
       exs.push({ q: document.getElementById(`ex-q-${i}`).value, a: document.getElementById(`ex-a-${i}`).value });
     }
     socket.emit('save_examples', exs);
-    alert("학습 데이터가 저장되었습니다.");
+    alert("저장됨");
   }
 
   function addLoreWithTags(){
@@ -999,9 +1468,8 @@ a, a:visited { color:#000 !important; text-decoration:none; }
     const content = document.getElementById('kw-c').value;
     const triggers = document.getElementById('tag-hidden').value;
     const idx = parseInt(document.getElementById('kw-index').value);
-    if(!title) return alert("키워드 이름을 입력하세요.");
-    if(!triggers) return alert("트리거 태그를 추가하세요.");
-    if(!content) return alert("상세 설정을 입력하세요.");
+    if(!title) return alert("이름 필요");
+    if(!triggers) return alert("트리거 필요");
     socket.emit('add_lore', {title, triggers, content, index: idx});
     clearLoreEditor();
   }
@@ -1012,13 +1480,13 @@ a, a:visited { color:#000 !important; text-decoration:none; }
     document.getElementById('kw-c').value = l.content || "";
     document.getElementById('kw-index').value = i;
     loadTagsFromString(l.triggers || "");
+    upCnt(document.getElementById('kw-c'));
   }
   function delLore(i){ socket.emit('del_lore', {index:i}); }
 
   function renderLoreList(){
     const list = document.getElementById('lore-list');
     if(!gState || !gState.lorebook) return;
-
     list.innerHTML = gState.lorebook.map((l,i)=>`
       <div class="lore-row" data-index="${i}">
         <div class="drag-handle">☰</div>
@@ -1032,14 +1500,12 @@ a, a:visited { color:#000 !important; text-decoration:none; }
         </div>
       </div>
     `).join('');
-
     if(sortable) sortable.destroy();
     sortable = new Sortable(list, {
       handle: '.drag-handle',
       animation: 120,
       onEnd: (evt) => {
-        if(evt.oldIndex === evt.newIndex) return;
-        socket.emit('reorder_lore', {from: evt.oldIndex, to: evt.newIndex});
+        if(evt.oldIndex === evt.newIndex) socket.emit('reorder_lore', {from: evt.oldIndex, to: evt.newIndex});
       }
     });
   }
@@ -1049,37 +1515,49 @@ a, a:visited { color:#000 !important; text-decoration:none; }
     const formData = new FormData();
     formData.append('file', input.files[0]);
     fetch('/import',{method:'POST',body:formData})
-      .then(res=>{ if(res.ok) alert("복원되었습니다."); else alert("복원 실패"); input.value=''; })
-      .catch(err=>alert("업로드 오류: "+err));
+      .then(res=>{ if(res.ok) alert("복원됨"); else alert("실패"); input.value=''; })
+      .catch(err=>alert("오류: "+err));
   }
 </script>
 </body>
 </html>
 """
 
-# =========================
-# Run (윈도우/리눅스 공용 수정본)
-# =========================
 if __name__ == "__main__":
-    try:
-        # 윈도우에서 에러 나는 subprocess.run(["pkill"...]) 부분을 삭제했어!
+    # 1. Pinggy 터널링 함수 (백그라운드 실행)
+    def start_pinggy():
+        print("🚀 [드림놀이] Pinggy 서버 연결 중...")
+        # Pinggy에 SSH로 포트 포워딩 연결 (엄격한 호스트 키 검사 비활성화)
+        cmd = "ssh -o StrictHostKeyChecking=no -p 443 -R0:localhost:5000 a.pinggy.io"
         
-        # pyngrok 자체 명령으로 기존 세션 종료
+        # 프로세스 실행
+        process = subprocess.Popen(
+            cmd, shell=True, 
+            stdout=subprocess.PIPE, 
+            stderr=subprocess.PIPE, 
+            text=True
+        )
+        
+        # 출력되는 로그에서 URL 찾기
+        print("\n" + "="*50)
+        print("🔗 아래 주소로 접속하세요 (잠시 후 뜹니다):")
         try:
-            ngrok.kill()
-        except:
-            pass
-        
-        # ngrok 연결 시도
-        # 토큰이 없으면 여기서 에러가 날 수 있으니 체크해
-        if not os.getenv("NGROK_AUTH_TOKEN"):
-             print("⚠️ NGROK_AUTH_TOKEN이 설정되지 않았습니다. .env 파일이나 환경변수를 확인하세요.")
-        
-        public_url = ngrok.connect(5000).public_url
-        print("\n" + "="*60)
-        print(f"🚀 [드림놀이 로컬서버] 가동 시작\n🔗 접속 주소: {public_url}")
-        print("="*60 + "\n")
+            while True:
+                line = process.stdout.readline()
+                if not line: break
+                # Pinggy는 주소를 텍스트로 뱉어줌
+                if "http" in line:
+                    print(f"\n👉 {line.strip()}\n")
+                    print("="*50 + "\n")
+        except Exception as e:
+            print(f"Pinggy Error: {e}")
 
-        socketio.run(app, host="0.0.0.0", port=5000, allow_unsafe_werkzeug=True)
-    except Exception as e:
-        print(f"❌ 실행 오류: {e}")
+    # 2. 별도 스레드에서 Pinggy 실행
+    t = threading.Thread(target=start_pinggy)
+    t.daemon = True
+    t.start()
+
+    # 3. Flask-SocketIO 서버 실행
+    # 잠시 대기 후 실행하여 로그 겹침 방지
+    time.sleep(3)
+    socketio.run(app, host="0.0.0.0", port=5000, allow_unsafe_werkzeug=True)
