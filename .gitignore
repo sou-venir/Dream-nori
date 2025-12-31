@@ -1,18 +1,24 @@
-# 중요: API 키가 들어있는 설정 파일 (절대 올리면 안 됨!)
+# 환경 변수 및 비밀 키 (가장 중요!)
 .env
 
-# 파이썬 캐시 파일
-__pycache__/
-*.pyc
-
-# 가상환경 폴더 (사용한다면)
-venv/
-env/
-.venv/
-
-# 세션 데이터 저장 폴더 (개인 기록 보호)
+# 세션 저장 데이터 폴더
 data/
-save_data.json
+*.json
 
-# 맥OS 시스템 파일 (지저분함 방지)
+# 파이썬 실행 시 생기는 임시 파일
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 가상환경 폴더
+venv/
+.venv/
+env/
+
+# 에디터 설정 파일 (VS Code, PyCharm 등)
+.vscode/
+.idea/
+
+# OS 생성 파일
 .DS_Store
+Thumbs.db
