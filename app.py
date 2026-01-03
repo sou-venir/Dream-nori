@@ -134,20 +134,6 @@ def get_export_config_only():
         "_export_type": "dream_config_only_v1"
     }
 
-def import_config_only(data: dict):
-    # 허용 리스트에 player_count와 output_limit을 꼭 넣어줘야 해!
-    allow = {
-        "session_title", "sys_prompt", "prologue", "ai_model",
-        "examples", "lorebook", "solo_mode", "player_count", "output_limit"
-    }
-    for k in allow:
-        if k in data:
-            state[k] = copy.deepcopy(data[k])
-
-    # 테마도 있다면 같이 불러오도록 추가하자
-    if "theme" in data:
-        state["theme"] = copy.deepcopy(data["theme"])
-
 def get_sanitized_state():
     safe = copy.deepcopy(state)
     for u in ["user1", "user2", "user3"]: # ✅ 반복문으로 처리하면 깔끔해
@@ -332,18 +318,12 @@ def auto_summary_apply():
 
 def simple_decrypt(data, key):
     try:
-        # 1. 외계어(Base64)를 푼다
         xor_bytes = base64.b64decode(data)
         key_bytes = key.encode('utf-8')
-        
-        # 2. ⭐ 핵심: 비밀번호를 가지고 섞인 데이터를 다시 푼다
         decrypted_bytes = bytes([b ^ key_bytes[i % len(key_bytes)] for i, b in enumerate(xor_bytes)])
-        
-        # 3. 다시 텍스트로 바꾸고 JSON으로 변환
         decrypted_str = decrypted_bytes.decode('utf-8')
         return json.loads(decrypted_str)
     except:
-        # 비밀번호가 틀리면 여기서 100% 에러가 나서 None을 반환함!
         return None
 
 # =========================
@@ -985,55 +965,56 @@ def load_scenario_url(data):
     auth_key = data.get("auth_key")
     is_adult = data.get("is_adult", False)
 
-    # 서버(코랩/환경변수)에 저장된 진짜 비번 가져오기
-    try:
-        REAL_ADULT_KEY = userdata.get('ADULT_KEY')
-    except:
-        REAL_ADULT_KEY = os.getenv('ADULT_KEY')
+    socketio.emit("status_update", {"msg": "⏳ 파일 다운로드 중..."})
 
     try:
-        response = requests.get(url, timeout=5)
-        response.raise_for_status()
+        # 1. 서버 키 가져오기 & 공백 제거(빗자루질)
+        real_key = os.getenv('ADULT_KEY')
+            
+        if real_key:
+            real_key = str(real_key).strip()
+        
+        if auth_key:
+            auth_key = str(auth_key).strip()
 
+        # 2. 파일 다운로드
+        res = requests.get(url, timeout=10)
+        res.raise_for_status()
+        raw_text = res.text.strip()
+
+        # 3. 성인 시나리오 처리
         if is_adult:
-            # 1. 문지기: 비번이 일치하는지 확인
-            if not REAL_ADULT_KEY or auth_key != REAL_ADULT_KEY:
-                socketio.emit("status_update", {"msg": "❌ 인증 코드가 틀렸습니다!"})
+            if not auth_key or auth_key != real_key:
+                socketio.emit("status_update", {"msg": "❌ 비밀번호가 틀렸습니다."})
                 return
-
-            # 2. 열쇠: 비번으로 섞인 데이터를 해독 (XOR)
-            scenario_data = simple_decrypt(response.text, auth_key)
+            
+            scenario_data = simple_decrypt(raw_text, auth_key)
             if not scenario_data:
-                socketio.emit("status_update", {"msg": "❌ 해독 실패! 파일이나 비번을 확인해줘."})
+                socketio.emit("status_update", {"msg": "❌ 파일 해독 실패! (파일이 손상됐거나 암호화 도구를 안 썼어)"})
                 return
         else:
-            scenario_data = response.json()
+            # 일반 시나리오
+            scenario_data = json.loads(raw_text)
 
-        # 데이터 초기화 (이전 세션 정보 날리기)
+        # 4. 데이터 적용 (초기화)
         state["ai_history"] = []
-        state["summary"] = ""
         state["pending_inputs"] = {}
         state["session_started"] = False
-        state["lorebook"] = []
-        state["examples"] = [{"q": "", "a": ""}, {"q": "", "a": ""}, {"q": "", "a": ""}]
-
-        for u in ["user1", "user2", "user3"]:
-            if u in state["profiles"]: state["profiles"][u]["locked"] = False
-
-        # 수정된 import 함수 호출 (인원수, 모델 제외됨!)
+        
         import_config_only(scenario_data)
 
-        # 테마 자동 분석
+        # 5. 테마 분석 및 저장
+        socketio.emit("status_update", {"msg": "🎨 테마 분석 중..."})
         combined = state.get("sys_prompt", "") + "\n" + state.get("prologue", "")
         state["theme"] = analyze_theme_color(state.get("session_title", ""), combined)
 
         save_data()
         emit_state_to_players()
-        socketio.emit("status_update", {"msg": "📂 시나리오 로드 완료!"})
+        socketio.emit("status_update", {"msg": "✅ 로드 완료!"})
 
     except Exception as e:
-        print(f"로드 에러: {e}")
-        socketio.emit("status_update", {"msg": f"❌ 로드 실패: {str(e)}"})
+        socketio.emit("status_update", {"msg": f"❌ 오류: {str(e)}"})
+        
 # =========================
 # HTML Template
 # =========================
