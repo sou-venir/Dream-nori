@@ -1,16 +1,23 @@
 # [1] 필수 라이브러리 설치 (코랩 환경 전용)
-
-import os, json, copy, re, requests, base64, urllib.parse, subprocess, threading, time
+import requests
+import base64
+import urllib.parse
+import os, json, copy, re
+import threading
+import time
 from datetime import datetime
 from flask import Flask, render_template_string, request, Response
 from flask_socketio import SocketIO, emit
 import openai
 import google.generativeai as genai
 
-# [수정] 로컬 폴더 경로 (코드가 있는 곳의 data 폴더)
-SAVE_PATH = './data'
+# =========================
+# Storage (로컬 저장소 사용)
+# =========================
+SAVE_PATH = './data'  # 현재 폴더 안에 data 폴더에 저장
 os.makedirs(SAVE_PATH, exist_ok=True)
 DATA_FILE = os.path.join(SAVE_PATH, "save_data.json")
+ADULT_KEY = os.getenv('ADULT_KEY')
 
 def save_data():
     try:
@@ -31,19 +38,22 @@ def load_data():
 # =========================
 # Keys & AI setup
 # =========================
-ADMIN_PASSWORD = userdata.get('ADMIN_PASSWORD')
+# 로컬/서버의 환경변수에서 키를 가져옴
+ADMIN_PASSWORD = os.getenv('ADMIN_PASSWORD', '1234') # 기본비번 1234
+OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
+GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
+
 
 gemini_model = None
-client = None  
+client = None
+
 try:
-    OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
-    client = openai.OpenAI(api_key=OPENAI_API_KEY)
-    try:
-        GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
-        if GEMINI_API_KEY:
-            genai.configure(api_key=GEMINI_API_KEY)
-            gemini_model = genai.GenerativeModel('gemini-3-pro-preview')
-    except: pass
+    if OPENAI_API_KEY:
+        client = openai.OpenAI(api_key=OPENAI_API_KEY)
+    
+    if GEMINI_API_KEY:
+        genai.configure(api_key=GEMINI_API_KEY)
+        gemini_model = genai.GenerativeModel('gemini-3-pro-preview')
 except Exception as e:
     print(f"❌ 설정 오류: {e}")
 
@@ -117,13 +127,10 @@ def get_export_config_only():
         "session_title": state.get("session_title", ""),
         "sys_prompt": state.get("sys_prompt", ""),
         "prologue": state.get("prologue", ""),
-        "ai_model": state.get("ai_model", "gpt-5.2"),
         "examples": state.get("examples", [{"q":"","a":""},{"q":"","a":""},{"q":"","a":""}]),
         "lorebook": state.get("lorebook", []),
-        "player_count": state.get("player_count", 3),     # 추가
-        "output_limit": state.get("output_limit", 2000), # 추가
-        "theme": state.get("theme"),                     # 추가
-        "solo_mode": bool(state.get("solo_mode", False)),
+        "output_limit": state.get("output_limit", 2000),
+        "theme": state.get("theme"),
         "_export_type": "dream_config_only_v1"
     }
 
@@ -187,7 +194,7 @@ def analyze_theme_color(title, sys_prompt):
     f"세션 제목: {title}\n"
     f"세션 프롬프트 / 프롤로그:\n{sys_prompt[:1200]}\n\n"
 
-    "위 텍스트를 **규칙 설명이 아닌, 감정·분위기·정서 이미지**의 관점에서 해석하십시오.\n"
+    "위 텍스트를 규칙 설명이 아닌, 감정·분위기·정서 이미지의 관점에서 해석하십시오.\n"
     "이 세션이 플레이어에게 주는 핵심 정서를 먼저 내부적으로 요약한 뒤 색을 결정하십시오.\n"
     "특히 다음 요소를 중점적으로 고려하십시오:\n"
     "- 긴장도 (높음/중간/낮음)\n"
@@ -284,7 +291,7 @@ def auto_summary_apply():
     def run_once():
         recent_log = "\n".join(state.get("ai_history", [])[-60:])
         if not recent_log: return None
-        
+
         current_model = state.get("ai_model", "gpt-5.2").lower()
 
         # 1. 제미나이 모델을 사용 중일 때 요약 (Gemini Flash 사용)
@@ -360,24 +367,48 @@ def export_config():
     resp.headers["Content-Disposition"] = f"attachment; filename*=UTF-8''{urllib.parse.quote(fname)}"
     return resp
 
-@app.route("/import", methods=["POST"])
+
+@app.route("/import", methods=["POST", "OPTIONS"]) # OPTIONS 메서드 추가
 def import_config():
+    if request.method == "OPTIONS": # Preflight 요청 처리 (CORS 에러 방지)
+        resp = Response()
+        resp.headers['Access-Control-Allow-Origin'] = '*'
+        resp.headers['Access-Control-Allow-Methods'] = 'POST, OPTIONS'
+        resp.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+        return resp
+
     try:
-        if "file" not in request.files: return "파일X", 400
+        if "file" not in request.files: return "파일이 없습니다.", 400
         file = request.files["file"]
-        if file.filename == "": return "파일X", 400
-        data = json.loads(file.read().decode('utf-8'))
+        if file.filename == "": return "파일명이 비어있습니다.", 400
+
+        # 파일 읽기 및 디코딩
+        content = file.read().decode('utf-8')
+        data = json.loads(content)
+
         import_config_only(data)
-        state["theme"] = analyze_theme_color(state.get("session_title", ""), state.get("sys_prompt", "") + "\n" + state.get("prologue", ""))
+
+        # 테마 재분석
+        combined = state.get("sys_prompt", "") + "\n" + state.get("prologue", "")
+        state["theme"] = analyze_theme_color(state.get("session_title", ""), combined)
 
         save_data()
         emit_state_to_players()
-        return "OK", 200
-    except Exception as e: return str(e), 500
+
+        # 성공 응답에도 헤더 추가
+        resp = Response("OK", status=200)
+        resp.headers['Access-Control-Allow-Origin'] = '*'
+        return resp
+
+    except Exception as e:
+        print(f"Import Error: {e}") # Colab 콘솔에 에러 출력
+        return str(e), 500
+
 
 # =========================
 # Socket Logic (Fixed Session Restoration)
 # =========================
+
 @socketio.on("join_game")
 def join_game(data=None):
     sid = request.sid
@@ -611,39 +642,36 @@ def reorder_lore(data):
         save_data(); emit_state_to_players()
     except: pass
 
-# (서버) reset_session 이벤트를 아래로 교체
 @socketio.on("reset_session")
 def reset_session(data):
     if str(data.get("password")) != str(state.get("admin_password")):
         emit("status_update", {"msg": "❌ 비밀번호가 일치하지 않습니다."})
         return
 
-    # 모든 상태를 완전 백지로 초기화
+    # 1. 세션 상태 초기화
     state["session_title"] = "드림놀이"
     state["theme"] = {"bg": "#ffffff", "panel": "#f1f3f5", "accent": "#e91e63"}
-    state["ai_model"] = "gpt-5.2"
-    state["solo_mode"] = False
+    # AI 모델이나 인원수는 엔진 설정이므로 유지하거나, 원하면 초기화해도 됨 (여기선 유지)
     state["session_started"] = False
 
-    # 프로필 정보 완전 초기화 (이름까지 빈칸으로)
-    state["profiles"]["user1"] = {"name": "", "bio": "", "canon": "", "locked": False}
-    state["profiles"]["user2"] = {"name": "", "bio": "", "canon": "", "locked": False}
-    state["profiles"]["user3"] = {"name": "", "bio": "", "canon": "", "locked": False} # ✅ 추가
+    # 2. 프로필: 내용은 유지하되 잠금만 해제! (요청사항 반영)
+    for u in ["user1", "user2", "user3"]:
+        if u in state["profiles"]:
+            state["profiles"][u]["locked"] = False
 
+    # 3. 나머지 데이터 삭제
     state["pending_inputs"] = {}
     typing_users.clear()
-
     state["ai_history"] = []
     state["summary"] = ""
     state["prologue"] = ""
     state["sys_prompt"] = ""
-
     state["lorebook"] = []
     state["examples"] = [{"q": "", "a": ""}, {"q": "", "a": ""}, {"q": "", "a": ""}]
 
     save_data()
     emit_state_to_players()
-    socketio.emit("status_update", {"msg": "🧹 모든 데이터가 삭제되어 백지가 되었습니다."})
+    socketio.emit("status_update", {"msg": "🧹 세션 데이터가 초기화되었습니다. (프로필 유지)"})
 
 def record_pending(uid, text):
     state.setdefault("pending_inputs", {})
@@ -651,201 +679,154 @@ def record_pending(uid, text):
     save_data()
 
 def check_all_ready():
-    pc = state.get("player_count", 3) # 기본값 3
+    """설정된 인원수가 모두 입력을 마쳤는지 확인"""
+    pc = state.get("player_count", 3)
     p = state.get("pending_inputs", {})
-
     if pc == 1:
         return "user1" in p
     elif pc == 2:
         return "user1" in p and "user2" in p
     else: # 3인
         return "user1" in p and "user2" in p and "user3" in p
-        
+
+def build_full_system_content(profile_content, sys_prompt, active_context, summary):
+    # 1. 월드 정보
+    lore_text = ""
+    if active_context:
+        lore_text = "### [IMPLICIT CONTEXT]\n" + "\n".join(active_context) + "\n\n"
+
+    # 2. 페어링 정보
+    pair_block = "### [RELATIONSHIPS]\n"
+    u1 = state['profiles']['user1']
+    pair_block += f"- Protagonist 1: '{u1.get('name', 'Char 1')}' (Partner: See Profile 1)\n"
+    if 'user2' in state['profiles']:
+        u2 = state['profiles']['user2']
+        if u2.get('name'):
+            pair_block += f"- Protagonist 2: '{u2.get('name', 'Char 2')}' (Partner: See Profile 2)\n"
+    if 'user3' in state['profiles']:
+        u3 = state['profiles']['user3']
+        if u3.get('name'):
+            pair_block += f"- Protagonist 3: '{u3.get('name', 'Char 3')}' (Partner: See Profile 3)\n"
+    pair_block += "\n*Focus strictly on the interactions defined in the profiles.*\n"
+
+    # ✅ [핵심] 수위 키워드 자동 감지 로직
+    # 시나리오 설정(sys_prompt)나 요약(summary)에 아래 단어가 있으면 성인 모드 ON
+    check_text = (sys_prompt + summary).lower()
+    nsfw_keywords = ["19금", "성인", "수위", "r-18", "r18", "nsfw", "adult", "음란", "노골", "섹스"]
+
+    is_adult_mode = any(k in check_text for k in nsfw_keywords)
+
+    if is_adult_mode:
+        rating_instruction = (
+            "### [RATING: R-18 / ADULT]\n"
+            "- **Explicit Content ALLOWED**: You may describe violence, blood, and sexual acts if the context requires it.\n"
+            "- **Uncensored**: Do not filter maturity. Focus on raw sensory details."
+        )
+    else:
+        rating_instruction = (
+            "### [RATING: PG-13 / TEEN]\n"
+            "- **Safe For Work**: Romantic tension and intimacy (kissing, hugging) are allowed.\n"
+            "- **RESTRICTION**: NO explicit sexual acts. NO extreme gore. Keep descriptions emotional and atmospheric."
+        )
+
+    return (
+        f"### [ENGINE IDENTITY: INVISIBLE SIMULATOR]\n"
+        f"You are a text simulation engine for a 'Dream Novel' (OC x Canon).\n"
+        f"Your goal is to simulate the **process** of the scene, not just the result.\n\n"
+
+        f"{rating_instruction}\n\n"
+
+        f"### [USER SCENARIO]\n"
+        f"{sys_prompt}\n\n"
+
+        f"### [CHARACTERS]\n{profile_content}\n\n"
+        f"{pair_block}\n"
+
+        f"### [ABSOLUTE SIMULATION RULES]\n"
+        f"1. **Timeframe**: One response covers approx. **30 seconds** of in-world time. (One specific event).\n"
+        f"2. **Pacing**: Write short, dense sentences. Stack micro-details (minimum 6 sensory details).\n"
+        f"3. **Perspective**: Focus on the NPC (Canon Character). Describe their eyes, breath, temperature, and minute movements.\n"
+        f"4. **No God-Modding**: NEVER write the Protagonist's dialogue, thoughts, or feelings. If they are silent, they remain silent.\n"
+        f"5. **Hidden Mechanics**: If a probability/dice check is implied, apply the result naturally in the narration. NEVER write 'Success' or 'Fail' explicitly.\n"
+        f"6. **Language**: Korean Only. Remove parenthetical English (e.g., '처녀성(Virginity)' -> '처녀성').\n\n"
+
+        f"{lore_text}"
+        f"### [PREVIOUS SUMMARY]\n{summary}\n"
+    ).strip()
+
 def build_gemini_prompt(system_content, priority_instruction, examples, prologue_text, round_block, limit):
-    """
-    Gemini 전용 프롬프트 빌더 (순서 최적화 버전)
-    """
-    prompt = ""
-    
-    # 1. 기본 시스템 설정 및 캐릭터 캐논
-    prompt += "### [SYSTEM & CHARACTER CANON]\n"
-    prompt += system_content.strip() + "\n\n"
+    return f"""
+{system_content}
 
-    # 2. 예시 (Examples) - AI에게 말투를 학습시킴
-    if examples:
-        prompt += "### [STYLE EXAMPLES]\n"
-        for ex in examples:
-            if ex.get("q") and ex.get("a"):
-                prompt += f"User: {ex['q']}\nModel: {ex['a']}\n"
-        prompt += "\n"
+[STORY CONTEXT]
+{prologue_text if prologue_text else ""}
+{"/".join(build_history_block())}
 
-    # 3. 과거 맥락 (프롤로그 + 히스토리)
-    prompt += "### [CONTEXT HISTORY]\n"
-    if prologue_text and len(state.get("ai_history", [])) < 40:
-        prompt += f"[PROLOGUE]: {prologue_text.strip()}\n"
-    
-    # build_history_block() 호출 시 인자 제거!
-    prompt += "\n".join(build_history_block()) + "\n\n"
+[NEW ACTIONS]
+{round_block}
 
-    # 4. 현재 상황 및 입력 (중요도 높음)
-    prompt += "### [CURRENT PLAYER INPUTS]\n"
-    prompt += round_block.strip() + "\n\n"
+[WRITER TASK]
+1. Write the next part of the novel in Korean.
+2. Focus on the Canon Character's emotions and sensory details.
+3. TARGET LENGTH: {limit} characters.
+4. DO NOT WRITE PLAYER DIALOGUE.
+""".strip()
 
-    # 5. 최종 지시사항 (제미나이가 가장 잘 듣는 위치)
-    prompt += "### [FINAL INSTRUCTION]\n"
-    prompt += priority_instruction.strip() + "\n"
-    
-    # 여기를 수정! (Strict Length Constraint 추가)
-    prompt += f"!!! [STRICT LENGTH CONSTRAINT] !!!\n"
-    prompt += f"- 작성 분량 제한: 공백 포함 최대 {limit}자.\n"
-    prompt += f"- 이 길이를 초과하려 하면 즉시 문장을 맺고 종료하십시오.\n"
-    prompt += "- 이전 대화가 길더라도, 이번 턴은 반드시 위 제한을 준수해야 합니다."
-
-    return prompt
-
-
-
+# 3. AI 실행 함수 (🔴 여기 수정됨: 쉼표 오류 수정 & 모델명 교정)
 def trigger_ai_from_pending():
     pc = state.get("player_count", 3)
-    limit = state.get("output_limit", 2000)
+    limit = int(state.get("output_limit", 2000))
 
     pending = state.get("pending_inputs", {})
     p1_text = pending.get("user1", {}).get("text", "(스킵)")
     p2_text = pending.get("user2", {}).get("text", "(스킵)")
     p3_text = pending.get("user3", {}).get("text", "(스킵)") if pc >= 3 else ""
 
-    u1 = state["profiles"]["user1"]
-    u2 = state["profiles"]["user2"]
-    u3 = state["profiles"]["user3"]
+    u1, u2, u3 = state["profiles"]["user1"], state["profiles"]["user2"], state["profiles"]["user3"]
+    p1_name = u1.get("name", "P1")
+    p2_name = u2.get("name", "P2")
+    p3_name = u3.get("name", "P3") if pc >= 3 else ""
 
-    p1_name, p1_bio, p1_canon = u1.get("name", "Player 1"), u1.get("bio", ""), u1.get("canon", "")
-    p2_name, p2_bio, p2_canon = u2.get("name", "Player 2"), u2.get("bio", ""), u2.get("canon", "")
+    last_ai_msg = next((h.replace("**AI**:", "").strip() for h in reversed(state.get("ai_history", [])) if h.startswith("**AI**:")), "")
+    merged_for_lore = f"{p1_text} {p2_text} {p3_text} {last_ai_msg}".lower()
+    active_context = [f"[{l.get('title','')}]: {l.get('content','')}" for l in state.get("lorebook", [])
+                      if any(t.strip().lower() in merged_for_lore for t in l.get("triggers","").split(",") if t.strip())][:3]
 
-    if pc >= 3:
-        p3_name, p3_bio, p3_canon = u3.get("name", "Player 3"), u3.get("bio", ""), u3.get("canon", "")
-    else:
-        p3_name, p3_bio, p3_canon = "", "", ""
+    profile_content = f"1. {p1_name} (Bio: {u1.get('bio','')}, Canon: {u1.get('canon','')})\n"
+    if pc >= 2: profile_content += f"2. {p2_name} (Bio: {u2.get('bio','')}, Canon: {u2.get('canon','')})\n"
+    if pc >= 3: profile_content += f"3. {p3_name} (Bio: {u3.get('bio','')}, Canon: {u3.get('canon','')})\n"
 
-    # 1. 키워드(Lore) 매칭
-    last_ai_msg = ""
-    for h in reversed(state.get("ai_history", [])):
-        if h.startswith("**AI**:"):
-            last_ai_msg = h.replace("**AI**:", "").strip()
-            break
-
-    merged_for_lore = f"{p1_text} {p2_text} {p3_text} {last_ai_msg}"
-    merged_lower = merged_for_lore.lower()
-
-    active_context = []
-    for l in state.get("lorebook", []):
-        triggers = [t.strip().lower() for t in (l.get("triggers","")).split(",") if t.strip()]
-        if any(t in merged_lower for t in triggers):
-            active_context.append(f"[{l.get('title','')}]: {l.get('content','')}")
-
-    active_context = active_context[:3]
-
-    sys_prompt = state.get('sys_prompt','')
-    prologue_text = state.get("prologue", "")
-
-    # [3] 프로필 프롬프트 조립
-    profile_content = f"### [CHARACTER PROFILES]\n1. {p1_name}\n- Bio: {p1_bio}\n- Relationship/Canon: {p1_canon}\n\n"
-    if pc >= 2:
-        profile_content += f"2. {p2_name}\n- Bio: {p2_bio}\n- Relationship/Canon: {p2_canon}\n\n"
-    if pc >= 3:
-        profile_content += f"3. {p3_name}\n- Bio: {p3_bio}\n- Relationship/Canon: {p3_canon}"
-
-    # 시스템 프롬프트: '결과 판정'을 강조
-    def build_full_system_content():
-        return (
-            f"### [ABSOLUTE RULE: CHARACTER FIDELITY]\n"
-            f"- If any narration conflicts with [MANDATORY CANON], the narration must be rewritten until canon consistency is restored.\n"
-            f"- [MANDATORY CANON]은 이 세계의 물리 법칙과 같으며, 이를 위반하는 서사는 존재할 수 없습니다.\n\n"
-            f"{profile_content}\n\n"
-
-            f"### [CORE LOGIC: ATTEMPT vs RESULT]\n"
-            f"1. **Player Input = Attempt (시도/의도)**: 플레이어의 입력은 '무엇을 하려 하는가'이다.\n"
-            f"2. **AI Output = Result (결과/반응)**: 당신은 그 시도가 성공했는지, 실패했는지, 주변 환경(NPC)이 어떻게 반응하는지를 서술한다.\n"
-            f"3. **No Forced Acting**: 플레이어 캐릭터의 입이나 몸을 빌려 임의로 연기하지 마라. 오직 외부 세계의 묘사에 집중하라.\n\n"
-
-            f"### [TIME RESOLUTION RULE — CRITICAL]\n"
-            f"1. 한 라운드에서 서술 가능한 시간은 '하나의 연속된 순간'까지만 허용된다.\n"
-            f"2. 플레이어가 명시하지 않은 다음 행동, 이동 완료, 결정 결과는 서술하지 않는다.\n"
-            f"3. 장면은 항상 '다음 행동이 발생하기 직전'에서 멈춘다.\n\n"
-
-            f"### [SCENE DENSITY RULE]\n"
-            f"1. 사건을 진행시키기보다, 감각 정보(시각, 소리, 거리, 긴장)를 확장하라.\n"
-            f"2. 인과 진행보다 상태 묘사를 우선하라.\n"
-            f"3. 변화는 미세하게, 정지는 길게 유지하라.\n\n"
-
-            f"### [NO UNDECLARED ACTION RULE]\n"
-            f"1. 플레이어가 선언하지 않은 이동, 조작, 접촉, 발화는 발생하지 않은 것으로 간주한다.\n"
-            f"2. 암시, 예측, 회상 형태로도 이를 서술하지 않는다.\n"
-
-            f"### [ANTI-RUSH RULE — OPENAI]\n"
-            f"- Do NOT conclude scenes.\n"
-            f"- Do NOT resolve conflicts fully.\n"
-            f"- Always end with unresolved spatial or emotional tension.\n"
-
-            f"### [Active Lore]\n" + "\n".join(active_context) + "\n\n"
-            f"### [Previous Summary]\n{state.get('summary','')}"
-        )
-
-    system_content = build_full_system_content()
-
-    if would_overflow_context(system_content + merged_for_lore):
-        auto_summary_apply()
-        system_content = build_full_system_content()
-
-    # 쐐기 지침 (빠져있던 변수 추가!)
-    char_list_str = f"{p1_name}"
-    if pc >= 2: char_list_str += f", {p2_name}"
-    if pc >= 3: char_list_str += f", {p3_name}"
+    system_content = build_full_system_content(profile_content, state.get("sys_prompt", ""), active_context, state.get("summary", ""))
 
     priority_instruction = (
-        f"!!! [EXECUTION ORDER] !!!\n"
-        f"1. Check Inputs: {char_list_str}의 행동을 확인하십시오.\n"
-        f"2. Simulation: 그들의 행동이 서로 충돌하는지, 혹은 NPC에게 어떤 영향을 주는지 계산하십시오.\n"
-        f"3. Narration: 플레이어의 문장을 그대로 복사하지 말고, '결과' 위주로 서술하십시오.\n"
-        f"   - (Good): A가 검을 휘두르자, 몬스터는 비명을 지르며 쓰러졌다.\n"
-        f"   - (Bad): A는 검을 휘두르기로 했다. A는 검을 잡고... (불필요한 과정 서술 금지)\n"
-        f"4. Format: {limit}자 내외로 장면을 서술하되, 결말이나 최종 결과는 유보하십시오.\n"
+        "### [URGENT: SLOW MOTION & HIGH DENSITY ENFORCEMENT]\n"
+        f"1. **TIME & RATIO**: 10% Action, 90% Reaction. Treat the scene as **30 seconds** frozen in time. For every 1 action, write 5 sentences of sensation.\n"
+        f"2. **TARGET LENGTH**: You MUST write at least {int(limit * 0.8)} characters. Do not summarize. Fill the space with dense atmospheric details.\n"
+        "3. **MICRO-FOCUS**: Describe the dust motes, the trembling pupils, the exact heat of the skin. Don't just say 'touched', describe the *texture*.\n"
+        "4. **NO PROGRESS**: Do not move to the next event. Stay in THIS exact moment. Do not ask 'What do you do?'.\n"
+        "5. **IMMERSION**: Do not invent Protagonist's actions. Only react. Use fluent Korean prose (No English)."
     )
 
-    # ✅ [4] 행동 입력 블록 조립 (덮어쓰기 버그 수정됨)
-    # 해석 주의사항을 먼저 넣고, 그 뒤에 입력값을 붙이는 방식
-    round_block = (
-        "--- [INTERPRETATION NOTICE] ---\n"
-        "아래 입력들은 플레이어들의 '동시 행동 선언'입니다.\n"
-        "AI는 이를 확정된 과거가 아닌, '현재 진행 중인 시도'로 해석하여 결과를 판정해야 합니다.\n\n"
-        "--- [ROUND INPUT] ---\n"
-    )
-    round_block += f"<{p1_name}>: {p1_text}\n"
-    if pc >= 2: round_block += f"<{p2_name}>: {p2_text}\n"
-    if pc >= 3: round_block += f"<{p3_name}>: {p3_text}\n"
 
-    # 메시지 리스트 조립
-    messages = [{"role":"system","content":system_content}]
-    for ex in state.get("examples", []):
-        if ex.get("q"): messages.extend([{"role":"user","content":ex["q"]}, {"role":"assistant","content":ex["a"]}])
+    round_block = f"--- [PROTAGONIST ACTIONS] ---\n- {p1_name}: {p1_text}\n"
+    if pc >= 2: round_block += f"- {p2_name}: {p2_text}\n"
+    if pc >= 3: round_block += f"- {p3_name}: {p3_text}\n"
 
-    if prologue_text and len(state.get("ai_history", [])) < 40:
-        messages.append({"role": "user", "content": f"### [PROLOGUE / INITIAL CONTEXT]\n{prologue_text}"})
-
+    messages = [{"role": "system", "content": system_content}]
     for h in build_history_block():
         messages.append({"role": "assistant" if h.startswith("**AI**") else "user", "content": h})
+    messages.append({"role": "user", "content": round_block + "\n" + priority_instruction})
 
-    messages.append({"role":"user","content": round_block})
-    # OpenAI 모델도 말을 잘 듣게 하기 위해 마지막에 instruction 추가
-    messages.insert(1, {"role":"system", "content": priority_instruction})
-
-
-    current_model = state.get("ai_model","gpt-5.2")
+    current_model = state.get("ai_model", "gemini-3-pro-preview")
     socketio.emit("status_update", {"msg": f"🤔 {current_model} 집필 중..."})
 
     ai_response = ""
     try:
-        # [1] 제미나이 호출 시도
+        safe_max_tokens = 4000
+
         if "gemini" in current_model.lower() and gemini_model:
+            # ✅ 기술적으로는 BLOCK_NONE을 유지 (안 그러면 키스나 싸움도 막힘)
+            # 하지만 위에서 프롬프트로 [RATING: PG-13]을 걸었기 때문에 AI가 스스로 자제함.
             from google.generativeai.types import HarmCategory, HarmBlockThreshold
             safe = {
                 HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
@@ -853,76 +834,65 @@ def trigger_ai_from_pending():
                 HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
                 HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
             }
-            
-            prompt = build_gemini_prompt(system_content, priority_instruction, state.get("examples", []), state.get("prologue", ""), round_block, limit)
-            
-            response = gemini_model.generate_content(
-                prompt,
-                safety_settings=safe,
-                generation_config={
-                    # [수정] 2배가 아니라 0.8배로 줄임! (물리적으로 더 못 쓰게 차단)
-                    "max_output_tokens": int(limit * 0.8), 
-                    "temperature": 0.8,
-                }
-            )
 
-            # 답변이 성공적으로 왔는지 확인
-            if response.candidates and response.candidates[0].content.parts:
-                ai_response = response.text
-            else:
-                # 🚨 제미나이가 거절했을 때! 바로 GPT-4o-mini로 긴급 전환
-                print("⚠️ 제미나이 차단됨 -> GPT로 긴급 전환합니다.")
-                if client:
-                    res = client.chat.completions.create(
-                        model="gpt-4o-mini", # 가볍고 필터링이 유연한 모델로 전환
-                        messages=messages,
-                        max_tokens=int(limit * 1.5)
-                    )
-                    ai_response = "(제미나이 필터로 인해 GPT가 대리 작성한 답변입니다)\n\n" + res.choices[0].message.content
-                else:
-                    ai_response = "⚠️ 제미나이가 답변을 거부했고, 대체할 GPT 키도 없습니다."
+            prompt = build_gemini_prompt(system_content, priority_instruction, [], state.get("prologue", ""), round_block, limit)
+            response = gemini_model.generate_content(prompt, safety_settings=safe, generation_config={"max_output_tokens": safe_max_tokens, "temperature": 0.8})
+            ai_response = response.text if response.text else ""
 
-        # [2] 처음부터 GPT 계열을 선택했을 때
         elif client:
-            dynamic_max_tokens = int(limit * 1.5)
-            res = client.chat.completions.create(
-                model=current_model,
-                messages=messages,
-                max_tokens=dynamic_max_tokens
-            )
+            res = client.chat.completions.create(model="gpt-4o", messages=messages, max_tokens=safe_max_tokens)
             ai_response = res.choices[0].message.content
-        else:
-            ai_response = "API Key Error."
-
     except Exception as e:
-        # 예외 발생 시에도 GPT로 한 번 더 시도하는 마지막 방어막
-        print(f"🔥 에러 발생: {e} -> 마지막 수단으로 GPT 시도")
-        try:
-            if client:
-                res = client.chat.completions.create(
-                    model="gpt-4o-mini",
-                    messages=messages,
-                    max_tokens=int(limit * 1.5)
-                )
-                ai_response = "(시스템 오류로 인해 예비 엔진이 작성한 답변입니다)\n\n" + res.choices[0].message.content
-            else:
-                ai_response = f"Error: {e}"
-        except:
-            ai_response = f"Critical Error: {e}"
+        print(f"🔥 Error: {e}")
+        ai_response = "생성 오류. 다시 시도해주세요."
 
+    # 후처리 (동일)
+    try:
+        import re
+        replacements = {
+            r'(?i)curtsy': '무릎을 굽혀 인사', r'(?i)smirk': '비릿한 미소', r'(?i)wink': '윙크',
+            r'(?i)shrug': '어깨를 으쓱', r'(?i)nod': '고개를 끄덕', r'(?i)sigh': '한숨',
+            r'(?i)giggle': '킥킥대', r'(?i)gm': '', r'(?i)pc': '', r'(?i)npc': ''
+        }
+        for pat, rep in replacements.items(): ai_response = re.sub(pat, rep, ai_response)
+        ai_response = re.sub(r'\([A-Za-z\s]+\)', '', ai_response)
+        ai_response = re.sub(r'\(|\)', '', ai_response)
+        bad_endings = [
+            r'어떻게 하시겠습니까\?', r'무엇을 하시겠습니까\?', r'선택하시겠습니까\?',
+            r'행동을 선택하세요.', r'당신의 선택은\?'
+        ]
+        for bad in bad_endings: ai_response = re.sub(bad, '', ai_response)
+        ai_response = re.sub(r'\d+\.\s.*', '', ai_response)
+    except: pass
 
-    # [마지막] 여기서부터 저장 및 전송 로직 (들여쓰기는 try랑 똑같이!)
+    if len(ai_response) > limit:
+        temp_cut = ai_response[:limit + 100]
+        last_punc = max(temp_cut.rfind('.'), temp_cut.rfind('!'), temp_cut.rfind('?'), temp_cut.rfind('"'))
+        if last_punc > limit * 0.5: ai_response = temp_cut[:last_punc+1]
+        else: ai_response = ai_response[:limit] + "..."
+
     history_line = f"**Round**: {p1_name}: {p1_text}"
     if pc >= 2: history_line += f" / {p2_name}: {p2_text}"
     if pc >= 3: history_line += f" / {p3_name}: {p3_text}"
-
     state["ai_history"].append(history_line)
     state["ai_history"].append(f"**AI**: {ai_response}")
     state["pending_inputs"] = {}
     save_data()
-
     socketio.emit("ai_typewriter_event", {"content": ai_response})
     emit_state_to_players()
+
+# GPT 백업 함수 (필요 시 복구)
+def trigger_gpt_failsafe(messages, limit):
+    if not client: return "AI 생성이 거부되었습니다. (백업 모델 없음)"
+    try:
+        res = client.chat.completions.create(
+            model="gpt-4o",
+            messages=messages,
+            max_tokens=limit
+        )
+        return res.choices[0].message.content
+    except:
+        return "AI 생성 실패."
 
 @socketio.on("client_message")
 def client_message(data):
@@ -986,39 +956,45 @@ def get_scenario_list(_=None):
 @socketio.on("load_scenario_url")
 def load_scenario_url(data):
     url = data.get("url")
-    auth_key = data.get("auth_key") # 유저가 입력한 비번
+    auth_key = data.get("auth_key")
     is_adult = data.get("is_adult", False)
 
     try:
-        # 공개 저장소니까 토큰 없이 그냥 가져와!
         response = requests.get(url, timeout=5)
         response.raise_for_status()
 
         if is_adult:
-            # 성인용이면 해독 시도! (auth_key가 해독 키 역할을 함)
-            # 여기서는 미리 암호화해서 올린 데이터를 푼다고 가정해.
             scenario_data = simple_decrypt(response.text, auth_key)
-
-            # 만약 설정한 특정 비번(SCENARIO_KEY)과
-            # 유저가 입력한 비번이 다르면 로드 거부!
-            if not scenario_data or auth_key != userdata.get('ADULT_KEY'):
-                socketio.emit("status_update", {"msg": "❌ 인증 코드가 틀렸거나 잘못된 파일입니다!"})
+            if not scenario_data or auth_key != os.getenv('ADULT_KEY'):
+                socketio.emit("status_update", {"msg": "❌ 인증 코드가 틀렸거나 잘못된 파일입니다"})
                 return
         else:
-            # 일반 시나리오는 그냥 읽기
             scenario_data = response.json()
 
+        # [중요] 새 시나리오 로드 전, 기존 내용 청소 (프로필 제외)
+        state["ai_history"] = []
+        state["summary"] = ""
+        state["pending_inputs"] = {}
+        state["session_started"] = False
+        state["lorebook"] = []
+        state["examples"] = [{"q": "", "a": ""}, {"q": "", "a": ""}, {"q": "", "a": ""}]
+
+        # 프로필 잠금 해제 (수정 가능하게)
+        for u in ["user1", "user2", "user3"]:
+             if u in state["profiles"]: state["profiles"][u]["locked"] = False
+
+        # 새 데이터 적용
         import_config_only(scenario_data)
 
-        # [이 코드를 추가!] 불러온 데이터로 테마 즉시 분석
-        state["theme"] = analyze_theme_color(state.get("session_title", ""), state.get("sys_prompt", "") + "\n" + state.get("prologue", ""))
+        # 테마 분석
+        combined = state.get("sys_prompt", "") + "\n" + state.get("prologue", "")
+        state["theme"] = analyze_theme_color(state.get("session_title", ""), combined)
 
         save_data()
         emit_state_to_players()
-        socketio.emit("status_update", {"msg": "📂 시나리오 로드 완료!"})
+        socketio.emit("status_update", {"msg": "📂 새 시나리오로 교체 완료! (이전 기록 삭제됨)"})
     except Exception as e:
         socketio.emit("status_update", {"msg": f"❌ 로드 실패: {str(e)}"})
-
 
 # =========================
 # HTML Template
@@ -1029,6 +1005,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <html>
 <head>
   <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
   <title>드림놀이</title>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
@@ -1328,35 +1305,96 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         gap: 5px;
         justify-content: flex-end;
     }
+    #mobile-menu-btn { display: none; } /* PC에선 숨김 */
+    #mobile-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.5); z-index: 150; backdrop-filter: blur(2px); }
 
+    @media (max-width: 768px) {
+        /* 1. 레이아웃 & 사이드바 */
+        #main { border-right: none; width: 100%; }
+        #chat-window { padding: 60px 15px 15px 15px; }
 
+        #sidebar {
+            position: fixed; top: 0; right: 0; bottom: 0; height: 100%;
+            width: 85%; max-width: 320px;
+            z-index: 200;
+            transform: translateX(100%); transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            box-shadow: -5px 0 20px rgba(0,0,0,0.15); border-left: none;
+        }
+        #sidebar.open { transform: translateX(0); }
+
+        /* 2. 모바일 메뉴 버튼 */
+        #mobile-menu-btn {
+            display: flex; position: absolute; top: 15px; right: 15px; z-index: 100;
+            background: var(--panel); border:1px solid rgba(0,0,0,0.1); border-radius:50%;
+            width:40px; height:40px; font-size:20px; align-items:center; justify-content:center;
+            cursor:pointer; box-shadow:0 2px 5px rgba(0,0,0,0.1); color:#555;
+        }
+
+        /* 3. 입력창 (패딩 강제 적용) */
+        #input-area {
+            /* 기본 10px + 하단 25px 추가해서 홈 버튼에 안 가려지게 함 */
+            padding: 10px 10px 35px 10px !important;
+            border-top: 1px solid rgba(0,0,0,0.05);
+
+            /* 최신 폰 안전 영역(Safe Area) 자동 대응 */
+            padding-bottom: calc(15px + env(safe-area-inset-bottom)) !important;
+        }
+        .input-row { flex-direction: column; gap: 8px; }
+        #msg-input { height: 60px; font-size: 16px; }
+        .btn-group { width: 100% !important; flex-direction: row !important; height: 44px; }
+        .btn-group button { flex: 1; height: 100%; width: auto !important; }
+
+        /* 4. 모달 & 기타 */
+        #admin-modal { padding: 0; }
+        .modal-content { height: 100%; max-height: 100%; border-radius: 0; }
+        .tab-content, .tab-content.active { flex-direction: column; }
+        .editor-side { flex: none; height: auto; max-height: 60%; border-right: none; border-bottom: 1px solid #eee; }
+        .list-side { flex: 1; padding-bottom: 30px; }
+        .bubble { max-width: 92%; font-size: 15px; }
+        .center-ai { width: 100%; max-width: 95%; }
+        .mobile-close-btn { display:block !important; } /* 사이드바 닫기 버튼 보이기 */
+    }
   </style>
 </head>
 
 <body>
+  <div id="mobile-menu-btn" onclick="toggleSidebar()">⚙️</div>
+  <div id="mobile-overlay" onclick="toggleSidebar()"></div>
+
   <div id="main">
     <div id="chat-window"><div id="chat-content"></div></div>
 
     <div id="input-area" style="padding:20px;background:var(--bg);">
-  <!-- 상태 메시지 (준비 대기 중... 같은 글자가 뜨는 곳) -->
-  <div id="status" style="font-size:12px;margin-bottom:5px;color:var(--accent);font-weight:bold;">대기 중</div>
+      <div id="status" style="font-size:12px;margin-bottom:5px;color:var(--accent);font-weight:bold;">대기 중</div>
 
-  <div style="display:flex;gap:10px;align-items:stretch;">
-    <!-- 입력창은 하나만! 그리고 처음에 disabled를 꼭 써줘 -->
-    <textarea id="msg-input" maxlength="600" placeholder="프로필 설정을 완료하고 마스터가 세션을 시작할 때까지 대기해주세요." disabled></textarea>
+      <div class="input-row" style="display:flex;gap:10px;align-items:stretch;">
+        <textarea id="msg-input" maxlength="600" placeholder="프로필 설정을 완료하고 마스터가 세션을 시작할 때까지 대기해주세요." disabled></textarea>
 
-    <div style="display:flex;flex-direction:column;gap:8px;width:110px;">
-      <!-- 버튼들도 처음엔 못 누르게 disabled 추가 -->
-      <button id="send-btn" onclick="send()" style="width:110px;" disabled>전송</button>
-      <button id="skip-btn" onclick="skipTurn()" style="width:110px;background:transparent;color:#666;border:1px solid rgba(0,0,0,0.2);padding:6px 10px;font-size:12px;font-weight:800;" disabled>스킵</button>
+        <!-- 버튼 그룹 -->
+        <div class="btn-group" style="display:flex;flex-direction:column;gap:8px;width:110px;flex-shrink:0;">
+
+          <!-- [수정] 스킵 버튼을 먼저 둠 -> 모바일에서 왼쪽에 위치 -->
+          <!-- flex: 1을 줘서 칸을 차지하게 하되, 색상을 연하게 -->
+          <button id="skip-btn" onclick="skipTurn()" style="flex:1; width:100%; background:transparent; color:#666; border:1px solid rgba(0,0,0,0.2); padding:0; font-size:13px; font-weight:800;" disabled>스킵</button>
+
+          <!-- [수정] 전송 버튼을 나중에 둠 -> 모바일에서 오른쪽에 위치 -->
+          <!-- flex: 2를 줘서 스킵보다 2배 더 넓게(중요하니까!) -->
+          <button id="send-btn" onclick="send()" style="flex:2; width:100%;" disabled>전송</button>
+
+        </div>
+      </div>
     </div>
-  </div>
-</div>
   </div>
 
   <div id="sidebar">
-    <div id="sidebar-body">
-      <h3>설정 <span id="role-badge" style="font-size:12px;color:var(--accent)"></span></h3>
+  <div id="sidebar-body">
+      <!-- 닫기 버튼 영역 -->
+      <div style="display:flex;justify-content:space-between;align-items:center;">
+          <h3>설정 <span id="role-badge" style="font-size:12px;color:var(--accent)"></span></h3>
+          <!-- 이 버튼이 있어야 모바일에서 닫힘 -->
+          <button onclick="toggleSidebar()" class="mobile-close-btn" style="background:transparent;color:#999;font-size:20px;padding:0;width:auto;display:none;">✕</button>
+      </div>
+      <style> @media(max-width:768px){ .mobile-close-btn { display:block !important; } } </style>
       <div id="role-display" style="padding:10px;background:rgba(0,0,0,0.05);border-radius:8px;font-weight:800;color:#555;">접속 중...</div>
 
       <div id="profile-wrap">
@@ -1418,8 +1456,12 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 </div>
 
                 <label>세션 데이터</label>
-                <div style="display:flex; gap:4px;">
-                    <a href="/export" style="flex:1;"><button style="width:100%; background:#444!important;" class="mini-btn">백업</button></a>
+                <div style="display:flex; gap:4px; width:100%;">
+                    <!-- a 태그에도 flex:1을 주고, 그 안의 버튼은 width:100% -->
+                    <a href="/export" style="flex:1; display:block;">
+                        <button style="width:100%; background:#444!important;" class="mini-btn">백업</button>
+                    </a>
+                    <!-- 불러오기 버튼도 flex:1 -->
                     <button onclick="document.getElementById('import-file').click()" style="flex:1; background:#666!important;" class="mini-btn">불러오기</button>
                     <input type="file" id="import-file" style="display:none;" onchange="uploadSessionFile(this)">
                 </div>
@@ -1432,6 +1474,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                     <option value="gpt-5.2">OpenAI GPT-5.2</option>
                     <option value="gpt-4o">OpenAI GPT-4o</option>
                     <option value="gemini-3-pro-preview">Google Gemini 3 Pro</option>
+                    <option value="gemini-3-flash-preview">Google Gemini 3 flash</option>
                 </select>
 
                 <label>플레이 모드</label>
@@ -1441,14 +1484,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                     <option value="1">1인 플레이</option>
                 </select>
                 <label style="display: flex; justify-content: space-between; align-items: center;">
-    AI 출력량
-    <span style="color: var(--accent); font-weight: 900; font-size: 14px;">
-        약 <span id="val-output-limit">2000</span>자
-    </span>
-</label>
-<input type="range" id="m-output-limit" min="1500" max="4000" step="500" value="2000"
-       oninput="document.getElementById('val-output-limit').innerText=this.value">
-
+                AI 출력량 <span style="color: var(--accent); font-weight: 900; font-size: 14px;">약 <span id="val-output-limit">2000</span>자</span>
+            </label>
+            <!-- ✅ [수정] 1000~3000, 500 단위 -->
+            <input type="range" id="m-output-limit" min="1000" max="3000" step="500" value="2000"
+                   oninput="document.getElementById('val-output-limit').innerText=this.value">
                 <div style="flex:1;"></div>
 
                 <div id="admin-main-controls" style="display:none; gap:8px;">
@@ -1466,13 +1506,20 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             <label>프롤로그</label>
             <textarea id="m-pro" class="fill-textarea" maxlength="1000" oninput="upCnt(this)"></textarea>
             <div id="cnt-m-pro" class="char-cnt">0/1000</div>
-            <button onclick="saveMaster()" class="save-btn" style="margin-top:10px;">저장</button>
+            <button onclick="saveAllSettings(false)" class="save-btn" style="margin-top:10px;">저장</button>
           </div>
           <div class="list-side" style="padding:20px;">
+            <label>시나리오 라이브러리</label>
+            <div style="display:flex; gap:8px; margin-bottom:15px;">
+                <select id="m-library-select"><option value="">목록 불러오는 중...</option></select>
+                <button onclick="applyLibraryScenario()" style="background:#4CAF50!important;" class="mini-btn">적용</button>
+            </div>
+            <button onclick="refreshLibrary()" class="mini-btn" style="width:100%; background:#666!important; margin-bottom:20px;">목록 새로고침</button>
             <label>안내</label>
             <p style="font-size:12px; color:#666;">제목과 프롤로그를 저장하면 분위기에 맞는 테마가 분석됩니다.</p>
           </div>
-        </div>
+        </div> <!-- 여기서 t-story가 잘 닫혔는지 확인! -->
+        <!-- 학습/키워드 탭은 기존과 동일하므로 생략하지만 닫는 태그를 꼭 확인해줘! -->
 
         <!-- 학습 탭 -->
         <div id="t-ex" class="tab-content">
@@ -1529,7 +1576,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             <div id="lore-list" style="flex:1; overflow-y:auto; display:flex; flex-direction:column; gap:8px;"></div>
           </div>
         </div>
-      </div> <!-- /.modal-body -->     
+      </div> <!-- /.modal-body -->
 <script>
 {% raw %}
   const socket = io(); // 반드시 가장 먼저 선언!
@@ -1539,8 +1586,14 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   let sortable = null;
   let isTypewriter = false;
   let editingIdx = -1;
-  let currentLibrary = []; // 중복 선언 제거됨
-
+  let currentLibrary = [];
+  let isRefusedMode = false; // 중복 선언 제거됨
+  function toggleSidebar() {
+    const sb = document.getElementById('sidebar');
+    const ov = document.getElementById('mobile-overlay');
+    sb.classList.toggle('open');
+    ov.style.display = sb.classList.contains('open') ? 'block' : 'none';
+  }
   // [1] 초기화 및 접속
   function getClientId(){
     let id = localStorage.getItem('dream_client_id');
@@ -1583,6 +1636,19 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         s.style.color = d.msg.includes('❌') ? 'red' : 'var(--accent)';
         if(d.msg.includes("세션이 시작되었습니다")) alert(d.msg);
     }
+  });
+
+  socket.on('ai_generation_failed', () => {
+    isRefusedMode = true; // 이 변수는 상단에 let isRefusedMode = false;로 선언해둬!
+
+    // 내가 썼던 글이 있으면 다시 입력창에 넣어주기
+    if(gState.pending_inputs && gState.pending_inputs[myRole]){
+        document.getElementById('msg-input').value = gState.pending_inputs[myRole].text;
+    }
+
+    // 다시 입력할 수 있게 UI 새로고침
+    refreshUI();
+    alert("AI가 생성을 거부했어. 내용을 수정해서 다시 보내봐!");
   });
 
   socket.on('ai_typewriter_event', d => {
@@ -1641,6 +1707,16 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       alert("목록 로드 실패: " + res.msg);
     }
   });
+  socket.on('ai_generation_failed', (d) => {
+    isRefusedMode = true; // 거절 모드 ON
+    alert("AI가 생성을 거부했습니다. 입력창이 활성화됩니다.");
+
+    // 내 입력이 남아있다면 입력창으로 다시 가져오기
+    if(gState.pending_inputs && gState.pending_inputs[myRole]){
+        document.getElementById('msg-input').value = gState.pending_inputs[myRole].text;
+    }
+    refreshUI(); // UI 갱신 (이제 잠금이 풀림)
+  });
 
   socket.on('reload_signal', payload => {
     if(payload && payload.clear_uuid) localStorage.removeItem('dream_client_id');
@@ -1681,7 +1757,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     const isStarted = !!gState.session_started;
     const isMyTurnDone = (gState.pending_status || []).includes(myRole);
     const isSpectator = (myRole === 'readonly');
-    const shouldLock = !isStarted || isMyTurnDone || isSpectator;
+
+    // 원래는 내 턴이 끝나면 잠기지만, 거절 모드일 땐 안 잠김
+    const shouldLock = !isStarted || isSpectator || (isMyTurnDone && !isRefusedMode);
 
     const msg = document.getElementById('msg-input');
     const sendBtn = document.getElementById('send-btn');
@@ -1742,19 +1820,45 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     }
 
     // 4. Profile Sync (입력 보호 적용)
+    // 4. Profile Sync (강력한 입력 보호: 작성 중인 내용 절대 지키기)
     const p = (myRole && gState.profiles[myRole]) ? gState.profiles[myRole] : {name:"",bio:"",canon:"",locked:false};
-    const activeId = document.activeElement?.id || "";
+    const activeId = document.activeElement ? document.activeElement.id : "";
 
-    if(activeId !== 'p-name') document.getElementById('p-name').value = p.name || "";
-    if(p.locked || activeId !== 'p-bio') { document.getElementById('p-bio').value = p.bio || ""; upCnt(document.getElementById('p-bio')); }
-    if(p.locked || activeId !== 'p-canon') { document.getElementById('p-canon').value = p.canon || ""; upCnt(document.getElementById('p-canon')); }
+    // [핵심 로직]
+    // 1. 잠겨있으면(locked): 무조건 서버 값으로 덮어씀 (확정된 상태니까).
+    // 2. 안 잠겨있으면: 칸이 '완전 빈칸'일 때만 서버에서 불러옴.
+    //    -> 즉, 내가 한 글자라도 적어놨다면 서버가 업데이트돼도 내 글을 지우지 않음.
 
+    // 이름
+    const elName = document.getElementById('p-name');
+    if (p.locked || (activeId !== 'p-name' && !elName.value)) {
+        elName.value = p.name || "";
+    }
+
+    // 캐릭터 설정
+    const elBio = document.getElementById('p-bio');
+    if (p.locked || (activeId !== 'p-bio' && !elBio.value)) {
+        elBio.value = p.bio || "";
+    }
+    upCnt(elBio); // 글자수 세기는 계속 갱신
+
+    // 드림캐 설정
+    const elCanon = document.getElementById('p-canon');
+    if (p.locked || (activeId !== 'p-canon' && !elCanon.value)) {
+        elCanon.value = p.canon || "";
+    }
+    upCnt(elCanon);
+
+    // 잠금 상태 UI 처리
     const locked = !!p.locked;
     document.getElementById('profile-lock-overlay').style.display = locked ? 'block' : 'none';
+
+    // 버튼 및 비활성화 처리
     const disableP = (myRole==='readonly') || locked;
     document.getElementById('p-name').disabled = disableP;
     document.getElementById('p-bio').disabled = disableP;
     document.getElementById('p-canon').disabled = disableP;
+
     const rb = document.getElementById('ready-btn');
     rb.disabled = disableP;
     rb.innerText = locked ? "설정이 확정되었습니다" : "설정 저장";
@@ -1859,12 +1963,16 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     const t = document.getElementById('msg-input').value.trim();
     if(!t) return;
     document.getElementById('send-btn').disabled = true;
+
     socket.emit('client_message', {uid: myRole, text: t});
+
+    isRefusedMode = false; // 👈 [추가] 다시 보냈으니 거절 모드 해제!
+
     document.getElementById('msg-input').value='';
     socket.emit('stop_typing', {uid: myRole});
   }
   function skipTurn(){
-    if(!confirm("스킵?")) return;
+    if(!confirm("스킵하시겠습니까?")) return;
     socket.emit('skip_turn', {uid: myRole});
     socket.emit('stop_typing', {uid: myRole});
   }
@@ -1914,7 +2022,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           authKey = prompt("🔞 성인 전용입니다. 인증 코드를 입력해주세요.");
           if(!authKey) return;
       }
-      if(confirm(`'${scenario.title}'를 불러올까?`)) socket.emit('load_scenario_url', { url: scenario.url, auth_key: authKey, is_adult: scenario.is_adult });
+      if(confirm(`'${scenario.title}'를 불러올까요?`)) socket.emit('load_scenario_url', { url: scenario.url, auth_key: authKey, is_adult: scenario.is_adult });
   }
   function uploadSessionFile(input){
     if(!input.files || !input.files[0]) return;
@@ -1989,28 +2097,12 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 """
 
 if __name__ == "__main__":
-    # Pinggy 실행 함수
-    def start_pinggy():
-        print("🚀 [드림놀이] Pinggy 서버 연결 중 (Local)...")
-        # 로컬 컴퓨터에 ssh가 설치되어 있어야 함
-        cmd = "ssh -o StrictHostKeyChecking=no -p 443 -R0:localhost:5000 a.pinggy.io"
-        
-        process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        
-        print("\n" + "="*50)
-        print("🔗 아래 주소로 접속하세요:")
-        try:
-            while True:
-                line = process.stdout.readline()
-                if not line: break
-                if "http" in line:
-                    print(f"\n👉 {line.strip()}\n")
-                    print("="*50 + "\n")
-        except: pass
+    # 포트 설정 (환경변수가 없으면 5000번)
+    port = int(os.environ.get("PORT", 5000))
+    
+    print("\n" + "="*50)
+    print(f"🚀 [드림놀이] 서버 시작! (Port: {port})")
+    print("="*50 + "\n")
 
-    # 핑기 스레드 시작
-    threading.Thread(target=start_pinggy, daemon=True).start()
-
-    # Flask 서버 실행
-    time.sleep(2)
-    socketio.run(app, host="0.0.0.0", port=5000)
+    # 서버 실행 (배포용 설정)
+    socketio.run(app, host="0.0.0.0", port=port, allow_unsafe_werkzeug=True)
