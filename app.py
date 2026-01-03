@@ -958,25 +958,58 @@ def get_scenario_list(_=None):
     except Exception as e:
         socketio.emit("scenario_list_res", {"success": False, "msg": str(e)})
 
+def import_config_only(data: dict):
+    # ❌ ai_model, player_count는 여기서 제외했어! 
+    # 이제 시나리오를 불러와도 현재 설정된 모델과 인원수는 변하지 않아.
+    allow = {
+        "session_title", 
+        "sys_prompt", 
+        "prologue", 
+        "examples", 
+        "lorebook", 
+        "solo_mode", 
+        "output_limit"
+    }
+    
+    for k in allow:
+        if k in data:
+            state[k] = copy.deepcopy(data[k])
+
+    # 테마도 시나리오의 분위기에 맞게 같이 불러와
+    if "theme" in data:
+        state["theme"] = copy.deepcopy(data["theme"])
+
 @socketio.on("load_scenario_url")
 def load_scenario_url(data):
     url = data.get("url")
     auth_key = data.get("auth_key")
     is_adult = data.get("is_adult", False)
 
+    # 서버(코랩/환경변수)에 저장된 진짜 비번 가져오기
+    try:
+        REAL_ADULT_KEY = userdata.get('ADULT_KEY')
+    except:
+        REAL_ADULT_KEY = os.getenv('ADULT_KEY')
+
     try:
         response = requests.get(url, timeout=5)
         response.raise_for_status()
 
         if is_adult:
+            # 1. 문지기: 비번이 일치하는지 확인
+            if not REAL_ADULT_KEY or auth_key != REAL_ADULT_KEY:
+                socketio.emit("status_update", {"msg": "❌ 인증 코드가 틀렸습니다!"})
+                return
+
+            # 2. 열쇠: 비번으로 섞인 데이터를 해독 (XOR)
             scenario_data = simple_decrypt(response.text, auth_key)
-            if not scenario_data or auth_key != os.getenv('ADULT_KEY'):
-                socketio.emit("status_update", {"msg": "❌ 인증 코드가 틀렸거나 잘못된 파일입니다"})
+            if not scenario_data:
+                socketio.emit("status_update", {"msg": "❌ 해독 실패! 파일이나 비번을 확인해줘."})
                 return
         else:
             scenario_data = response.json()
 
-        # [중요] 새 시나리오 로드 전, 기존 내용 청소 (프로필 제외)
+        # 데이터 초기화 (이전 세션 정보 날리기)
         state["ai_history"] = []
         state["summary"] = ""
         state["pending_inputs"] = {}
@@ -984,23 +1017,23 @@ def load_scenario_url(data):
         state["lorebook"] = []
         state["examples"] = [{"q": "", "a": ""}, {"q": "", "a": ""}, {"q": "", "a": ""}]
 
-        # 프로필 잠금 해제 (수정 가능하게)
         for u in ["user1", "user2", "user3"]:
-             if u in state["profiles"]: state["profiles"][u]["locked"] = False
+            if u in state["profiles"]: state["profiles"][u]["locked"] = False
 
-        # 새 데이터 적용
+        # 수정된 import 함수 호출 (인원수, 모델 제외됨!)
         import_config_only(scenario_data)
 
-        # 테마 분석
+        # 테마 자동 분석
         combined = state.get("sys_prompt", "") + "\n" + state.get("prologue", "")
         state["theme"] = analyze_theme_color(state.get("session_title", ""), combined)
 
         save_data()
         emit_state_to_players()
-        socketio.emit("status_update", {"msg": "📂 새 시나리오로 교체 완료! (이전 기록 삭제됨)"})
-    except Exception as e:
-        socketio.emit("status_update", {"msg": f"❌ 로드 실패: {str(e)}"})
+        socketio.emit("status_update", {"msg": "📂 시나리오 로드 완료!"})
 
+    except Exception as e:
+        print(f"로드 에러: {e}")
+        socketio.emit("status_update", {"msg": f"❌ 로드 실패: {str(e)}"})
 # =========================
 # HTML Template
 # =========================
