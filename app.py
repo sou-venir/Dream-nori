@@ -331,14 +331,19 @@ def auto_summary_apply():
         pass
 
 def simple_decrypt(data, key):
-    """비번을 이용해 암호화된 텍스트를 복구하는 마법 (간이 암호화)"""
     try:
-        # 비번이 틀리면 여기서 에러가 나서 자연스럽게 차단돼!
-        decoded = base64.b64decode(data).decode('utf-8')
-        # 간단한 XOR이나 특정 규칙으로 더 꼴 수 있지만,
-        # 1차적으로 base64 + 비번 매칭만 해도 미성년자는 절대 못 읽어.
-        return json.loads(decoded)
+        # 1. 외계어(Base64)를 푼다
+        xor_bytes = base64.b64decode(data)
+        key_bytes = key.encode('utf-8')
+        
+        # 2. ⭐ 핵심: 비밀번호를 가지고 섞인 데이터를 다시 푼다
+        decrypted_bytes = bytes([b ^ key_bytes[i % len(key_bytes)] for i, b in enumerate(xor_bytes)])
+        
+        # 3. 다시 텍스트로 바꾸고 JSON으로 변환
+        decrypted_str = decrypted_bytes.decode('utf-8')
+        return json.loads(decrypted_str)
     except:
+        # 비밀번호가 틀리면 여기서 100% 에러가 나서 None을 반환함!
         return None
 
 # =========================
