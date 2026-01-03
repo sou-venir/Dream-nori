@@ -1,6 +1,6 @@
-Flask
-Flask-SocketIO
-openai
-google-generativeai
-requests
-python-dotenv
+flask
+    flask-socketio
+    openai
+    google-generativeai
+    requests
+    python-socketio
